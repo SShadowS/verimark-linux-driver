@@ -1,0 +1,16 @@
+# fido2-token probe of VeriMark DT (interface 0, FIDO HID)
+# captured 2026-07-07T12:38:49+02:00
+
+## fido2-token -L
+/dev/hidraw7: vendor=0x047d, product=0x00f2 ( VeriMark DT Fingerprint Key)
+
+## fido2-token -I /dev/hidraw7
+proto: 0x02
+major: 0x31
+minor: 0x5d
+build: 0xf5
+caps: 0x00 (nowink, nocbor, msg)
+
+## interpretation
+caps 0x00 = nowink,nocbor,msg  ->  U2F/CTAP1 ONLY (no CBOR = no FIDO2/CTAP2 = no authenticatorBioEnrollment).
+=> fingerprint is NOT exposed via standard FIDO tooling; it lives only behind vendor interface 1 (TLS channel).

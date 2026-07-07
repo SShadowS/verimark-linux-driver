@@ -1,0 +1,15 @@
+# Proprietary vendor artifacts and secrets — NEVER commit / redistribute.
+re/
+captures/
+ghidra-projects/
+*.pcapng
+*.pcap
+*.sys
+*.dll
+*.exe
+*.cab
+*.key
+# keep the placeholders
+!re/.gitkeep
+!captures/.gitkeep
+!.gitignore

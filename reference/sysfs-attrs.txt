@@ -1,0 +1,8 @@
+sysfs path: /sys/bus/usb/devices/3-3.4.1.1
+idVendor       047d
+idProduct      00f2
+product        VeriMark DT Fingerprint Key
+bcdDevice      0000
+bMaxPower      100mA
+speed          12
+version         2.00
