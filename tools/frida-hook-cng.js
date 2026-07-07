@@ -26,6 +26,19 @@ function dumpKey(ptr, len, label) {
   }
 }
 
+// Read a length that may be passed by value or by pointer (pcbResult).
+function readLen(arg, maxCap) {
+  try {
+    const n = arg.toInt32();
+    if (n >= 0 && n <= maxCap) return n;
+  } catch (e) {}
+  try {
+    const n = arg.readU32();
+    if (n >= 0 && n <= maxCap) return n;
+  } catch (e) {}
+  return -1;
+}
+
 const TARGETS = {
   'bcrypt.dll': [
     'BCryptSecretAgreement',       // ECDH: produces the shared secret handle
@@ -62,12 +75,34 @@ Object.keys(TARGETS).forEach(function (mod) {
           }
         }
         // BCryptGenerateSymmetricKey(hAlg, *phKey, *pbKeyObject, cbKeyObject, pbSecret, cbSecret, flags)
+        // pbSecret is the raw AES session-key material -> the prize for decrypting the channel.
         if (this.fn === 'BCryptGenerateSymmetricKey') {
           const pbSecret = this.a[4];
           const cbSecret = this.a[5].toInt32();
           if (pbSecret && !pbSecret.isNull() && cbSecret > 0 && cbSecret < 4096) {
             dumpKey(pbSecret, cbSecret, 'symKeySecret');
           }
+        }
+        // BCryptExportKey(hKey, hExportKey, pszBlobType, pbOutput, cbOutput, *pcbResult, flags)
+        // Grabs exported public keys / EC blobs used in the pairing/handshake.
+        if (this.fn === 'BCryptExportKey') {
+          const pbuf = this.a[3];
+          const clen = readLen(this.a[5], 8192);   // pcbResult (actual bytes written)
+          if (pbuf && !pbuf.isNull() && clen > 0) dumpKey(pbuf, clen, 'exportedBlob');
+        }
+        // AES-CBC runs through BCrypt{Encrypt,Decrypt}; dumping the buffers yields the
+        // *plaintext* Tudor command/response protocol directly - no pcap decryption needed.
+        // BCryptEncrypt(hKey, pbInput, cbInput, *pad, pbIV, cbIV, pbOutput, cbOutput, *pcbResult, flags)
+        if (this.fn === 'BCryptEncrypt') {
+          const pin = this.a[1], cin = readLen(this.a[2], 65536);
+          const piv = this.a[4], civ = readLen(this.a[5], 64);
+          if (piv && !piv.isNull() && civ > 0) dumpKey(piv, civ, 'enc.IV');
+          if (pin && !pin.isNull() && cin > 0) dumpKey(pin, cin, 'PLAINTEXT-OUT');
+        }
+        // BCryptDecrypt(hKey, pbInput, cbInput, *pad, pbIV, cbIV, pbOutput, cbOutput, *pcbResult, flags)
+        if (this.fn === 'BCryptDecrypt') {
+          const pout = this.a[6], cout = readLen(this.a[8], 65536);
+          if (pout && !pout.isNull() && cout > 0) dumpKey(pout, cout, 'PLAINTEXT-IN');
         }
       },
     });
@@ -76,5 +111,6 @@ Object.keys(TARGETS).forEach(function (mod) {
 });
 
 console.log('CNG hooks installed. Enroll/verify a finger on Windows now.');
+console.log('Key material: symKeySecret / derivedKey.  Plaintext protocol: PLAINTEXT-OUT/-IN.');
 console.log('Tip: also capture USB with Wireshark+USBPcap; feed the dumped key');
-console.log('     into Wireshark or tools/decode-tls-records.py to decrypt.');
+console.log('     into Wireshark or tools/decode-tls-records.py to decrypt the 17 03 03 records.');
