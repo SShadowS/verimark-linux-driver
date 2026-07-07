@@ -13,3 +13,7 @@ ghidra-projects/
 !re/.gitkeep
 !captures/.gitkeep
 !.gitignore
+
+# Python bytecode
+__pycache__/
+*.pyc
