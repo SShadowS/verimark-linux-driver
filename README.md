@@ -1,59 +1,80 @@
 # VeriMark Desktop — Linux fingerprint driver project
 
-Goal: make the **Kensington VeriMark Desktop (`047d:00f2`)** usable as a normal
-Linux fingerprint reader (enroll/verify through `fprintd` + PAM), by writing a
-`libfprint` driver for it. This folder is the starting point: every fact, dump,
-and source gathered so far, plus an honest RE plan.
+![license](https://img.shields.io/badge/license-LGPL--2.1--or--later-blue)
+![platform](https://img.shields.io/badge/platform-Linux%20%C2%B7%20libfprint-informational)
+![device](https://img.shields.io/badge/USB-047d%3A00f2-orange)
+![status](https://img.shields.io/badge/status-GO%20%E2%80%94%20RE%20mapped%2C%20skeleton%20drafted-brightgreen)
+![next](https://img.shields.io/badge/next-Windows%20capture%20phase-yellow)
 
-> **Read `plan.md` before spending money on time.** The device gates its
-> biometric channel behind a **TLS-encrypted secure channel**, and one prior
-> effort on this exact device stalled there. This is a hard RE project with a
-> real chance of being infeasible without extracting a key from the Windows
-> driver or firmware. This folder is written so you go in with eyes open.
+Making the **Kensington VeriMark Desktop (`047d:00f2`)** — a Synaptics match-on-chip
+fingerprint reader — usable on Linux via a clean-room **`libfprint`** driver.
 
-## The device, precisely characterized (2026-07-07)
+## Status
 
-It's a **FIDO U2F security key + Windows-Hello fingerprint** in one dongle. Two
-USB interfaces, two totally different worlds:
+The reverse-engineering is **done to the static ceiling**, and the project's
+go/no-go gate is **GO** (proven from decompiled code): the sensor's secure channel
+is **server-authenticated TLS 1.2 with no client cert and no TPM binding**, so it's
+impersonable from a stock Linux host. See **[`findings/DECISION.md`](findings/DECISION.md)**.
+
+| Area | State |
+|---|---|
+| GO/NO-GO verdict | ✅ **GO** — server-auth TLS, host-anonymous ECDH pairing, no TPM |
+| Protocol map | ✅ transport, TLS framing, pairing, full ~31-command surface, operation state machines — **[`findings/21-command-reference.md`](findings/21-command-reference.md)** |
+| Driver | 🟨 **skeleton** drafted (`FpDeviceClass` + operation SSMs) — **[`driver/`](driver/)** |
+| Remaining | ⏳ encrypted command bodies + exact handshake bytes — need a **Windows working-session capture** (USBPcap + Frida), then fill the `driver/`'s `TODO(capture)` gaps |
+
+## Clone
+
+```sh
+git clone https://github.com/SShadowS/verimark-linux-driver.git
+cd verimark-linux-driver
+```
+
+Cross-machine (dual-boot) workflow: reverse-engineering and the driver are edited on
+**Linux**; the capture phase runs on **Windows** (the dongle enrolls under the
+vendor driver there). Clone on both, `git pull`/`push` to sync. Note: the
+proprietary vendor binaries, Ghidra decompiles, and captures are **git-ignored**
+(kept local only) — see `.gitignore`.
+
+## The device, precisely characterized
+
+A **FIDO U2F security key + Windows-Hello fingerprint** in one dongle — two USB
+interfaces, two different worlds:
 
 | Iface | Class | What it is | Linux status |
 |---|---|---|---|
-| **0** | HID, usage page `0xF1D0` | **FIDO / U2F** authenticator (CTAPHID: 64B in/out reports) | **Works today** as a U2F key. But `caps=nocbor` → CTAP1/U2F **only**, no FIDO2/CTAP2, so **no** standard `authenticatorBioEnrollment`. The fingerprint is *not* reachable here. |
-| **1** | Vendor-specific `0xFF` | **Synaptics match-on-chip biometric** channel (Windows Hello / WBF) | **The target.** Opaque, and wrapped in **TLS** (`17 03 03 …` app-data records). This is what a `libfprint` driver must speak. |
-
-So the driver problem = **reverse-engineer interface 1's encrypted vendor
-protocol** and reimplement it. Interface 0 is a red herring for the fingerprint
-goal (though it means the dongle is already useful as a WebAuthn 2FA key via
-`libfido2`/`pam-u2f` — see `plan.md` §"If you just want auth, not a driver").
-
-## Why it's hard (the one-paragraph version)
-
-The fingerprint sensor is a Synaptics **match-on-chip** unit: templates never
-leave the chip, and host↔sensor traffic runs inside a **TLS session** (this is
-what modern secure fingerprint stacks — Synaptics SDCP, Windows "Enhanced Sign-in
-Security" — do on purpose). You cannot learn the plaintext protocol by sniffing
-USB, because that's exactly the threat TLS defends against. Progress requires
-reversing the **Windows driver binary** to recover the handshake / key material —
-and if the sensor authenticates the host with a key held in tamper-resistant
-firmware, there may be nothing extractable at all.
+| **0** | HID, usage page `0xF1D0` | **FIDO / U2F** authenticator (CTAPHID) | **Works today** as a U2F key (`pam-u2f`). CTAP1/U2F only — no CTAP2, so the fingerprint is *not* reachable here. |
+| **1** | Vendor `0xFF` | **Synaptics "Tudor" match-on-chip** biometric channel | **The target.** Wrapped in server-auth TLS 1.2 (`17 03 03 …`). What the `libfprint` driver speaks. |
 
 ## Folder map
 
 ```
-README.md            ← you are here: goal, device model, honest framing
-device-facts.md      ← every hardware fact, both interfaces decoded
-prior-art.md         ← the existing RE attempt + community status + protocol background
-plan.md              ← concrete RE roadmap, tools, go/no-go gates, libfprint driver anatomy
-sources.md           ← annotated links (everything found)
-dump-device-info.sh  ← regenerate the reference/ snapshots on demand
-reference/           ← live dumps from THIS machine (lsusb -v, HID rdesc, fido probe, sysfs)
-captures/            ← (empty) put USB traffic captures here (usbmon .pcapng, etc.)
-prototype/           ← (empty) Python/pyusb scratch code goes here before a C driver
+README.md            ← this file
+findings/            ← the reverse-engineering output:
+   DECISION.md          GO/NO-GO verdict + evidence
+   10-crypto-map.md     secure channel (TLS/ECDH/AES, no TPM)
+   20-protocol.md       Tudor protocol (transport, handshake, command stack)
+   21-command-reference.md   ⭐ driver-facing reference: full command surface + state machines
+   00/30/40/50, research-summary.md   inventory, synaTudor, UMDF1-host scope, ghidra scope
+driver/              ← clean-room libfprint driver SKELETON (verimark.c/.h, verimark-tls.h)
+tools/               ← RE toolbox: device probe, usbmon parser, TLS decoder,
+                       Frida hook (Windows), Ghidra headless + scripts
+device-facts.md · prior-art.md · plan.md · sources.md · RESEARCH-PROMPT.md   ← docs
+reference/           ← live device dumps (lsusb -v, HID rdesc, fido probe, sysfs)
+dump-device-info.sh  ← regenerate reference/ snapshots
 ```
 
-## Fastest way to learn if this is even possible
+## Next step (the Windows capture phase)
 
-The whole project hinges on one question — *can the TLS endpoint be
-impersonated from the host, or is the key in firmware?* `plan.md` §1 is a
-cheap-ish recon step to answer it before committing to a full driver. Do that
-first.
+The only thing between the skeleton and a working driver is a capture of a real
+session to fill the encrypted gaps. Per `plan.md` §3: on Windows, run
+**USBPcap + `tools/frida-hook-cng.js`** during enroll/verify to dump the session
+key + wire bytes, then decrypt and fill the `driver/`'s `TODO(capture)` markers
+(`driver/README.md` lists exactly which capture closes which gap). No further static
+RE is needed — see `findings/21` "Static-research ceiling".
+
+## Don't need a driver, just auth?
+
+Interface 0 already works as a **U2F/WebAuthn** key (`pamu2fcfg` + `pam-u2f`), and
+the laptop's built-in Synaptics reader (`06cb:0126`) works with `fprintd` today.
+See `plan.md` §0.
