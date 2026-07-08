@@ -1,5 +1,11 @@
 # Resume prompt — VeriMark Linux driver (Fedora box)
 
+> **⚠ SUPERSEDED (2026-07-08): P0 + P0b are DONE.** The transport is solved and
+> verified, and the reuse stack runs read-only against the device. **To continue, use
+> `RESUME-P1-PAIRING.md`** (next step = P1 pairing + TLS), not this file. This one is
+> kept for history; some "hard facts" below were corrected (the transport is EP0-control
+> on iface1, not the earlier wording) — see `findings/26`/`27`.
+
 Paste the block below into a fresh Claude Code session on the Linux box to continue.
 It is self-contained: it names the state, the hard facts (so you don't re-derive
 them), what's reusable, what's left, and the first actions.
@@ -21,10 +27,16 @@ You are resuming a reverse-engineering → driver project. The Windows RE phase 
 
 **Hard facts already established (do NOT re-RE these):**
 
-- **USB transport:** iface1 is vendor-class with a **single endpoint — `0x83`
-  interrupt-IN, 8 bytes.** There is **NO bulk pipe and no OUT pipe.** Commands go out
-  as **EP0 control transfers**; responses/events arrive on the **interrupt-IN `0x83`**
-  (TLS records chunked across transfers). iface0 is HID (unused for this).
+- **USB transport (VERIFIED — see `findings/27`):** iface0 is **FIDO U2F HID** (unused
+  for this). The biometric channel is **iface1**, vendor-class, whose only endpoint is
+  `0x83` interrupt-IN, 8 bytes (**async events only**). No bulk/OUT pipe → the sensor's
+  logical bulk channel is **tunnelled over EP0 vendor control transfers**:
+  **command WRITE** = `bmRequestType=0x40, bRequest=0x16, wValue=(len&7), wIndex=0`, data
+  **padded to a multiple of 8** (chunked at 4096, continuation flags `0x4000`/`0x8000`);
+  **response READ** = `0xc0, 0x17, wValue=0` (retry-on-timeout). **Responses come on
+  control-IN, NOT `0x83`.** Confirmed three ways: 132-DLL decompile, a live probe
+  (`prototype/p0_ctrl.py`: GET_VERSION→FW 10.1 PROVISIONED, GET_START_INFO 68 B), and the
+  Windows wire pcap. FW **10.1** ⇒ `synaTudor@rev`'s `sensor_keys/10.1.tsk` is the key.
 - **Secure channel:** TLS 1.2, negotiated suite
   **`0xC02E` = TLS_ECDH_ECDSA_WITH_AES_256_GCM_SHA384**. **Static ECDH** P-256 (not
   ECDHE): premaster = ECDH(host-ephemeral-priv, device-cert key). Server-auth only, **no

@@ -9,6 +9,12 @@ ghidra-projects/
 *.exe
 *.cab
 *.key
+# Host pairing identity (contains the host EC private key) — local secret, never commit.
+prototype/pdata/
+# Raw byte dump extracted from the proprietary DLL (regenerable from Ghidra) — treat like re/.
+prototype/p256_params.bin
+prototype/images/
+
 # keep the placeholders
 !re/.gitkeep
 !captures/.gitkeep

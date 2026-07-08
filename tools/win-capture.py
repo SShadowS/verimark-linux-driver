@@ -180,6 +180,9 @@ def main():
     ap.add_argument("--selftest", action="store_true",
                     help="attach, confirm hooks install, then detach (no enroll needed)")
     ap.add_argument("--no-usb", action="store_true", help="skip USBPcap; frida hook only")
+    ap.add_argument("--pairing", action="store_true",
+                    help="pairing-capture mode: on-screen steps for a FRESH pairing "
+                         "(run win-unpair-verimark.ps1 first, then replug to trigger 0x93)")
     ap.add_argument("--out", help="frida log path (default: captures/win-cng-<pid>.log)")
     args = ap.parse_args()
 
@@ -276,10 +279,24 @@ def main():
 
     emit("")
     emit("  ==================================================================")
-    emit("  NOW: enroll and then verify a finger.")
-    emit("   - Settings > Accounts > Sign-in options > Fingerprint recognition")
-    emit("   - Add / set up, swipe to enroll, then remove+verify a few times.")
-    emit("  When done, come back here and press ENTER to stop and save.")
+    if args.pairing:
+        emit("  PAIRING CAPTURE MODE - the capture is now RUNNING. Do this, in order:")
+        emit("   1. You should have ALREADY run win-unpair-verimark.ps1 (no stored pairing).")
+        emit("   2. NOW trigger a fresh device init so 0x93 pairing happens ON CAMERA:")
+        emit("        - UNPLUG the VeriMark, wait 3s, PLUG it back in.   (best)")
+        emit("        - or: Device Manager > the VeriMark > Disable then Enable.")
+        emit("   3. Settings > Accounts > Sign-in options > Fingerprint > Set up,")
+        emit("      and enroll a finger. The FIRST setup after unpair re-runs pairing +")
+        emit("      the host-authorization we need. Swipe until enrolled.")
+        emit("   4. (optional) remove + verify once to catch steady-state too.")
+        emit("   Keep this window open the WHOLE time - pairing fires on replug/first-init,")
+        emit("   which is why capture is started BEFORE you replug.")
+        emit("  When fully done, come back here and press ENTER to stop and save.")
+    else:
+        emit("  NOW: enroll and then verify a finger.")
+        emit("   - Settings > Accounts > Sign-in options > Fingerprint recognition")
+        emit("   - Add / set up, swipe to enroll, then remove+verify a few times.")
+        emit("  When done, come back here and press ENTER to stop and save.")
     emit("  ==================================================================")
     try:
         input()
