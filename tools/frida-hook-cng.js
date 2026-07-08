@@ -60,8 +60,12 @@ function gcmInfo(pInfo) {
   } catch (e) { return null; }
 }
 
-function dumpGcmField(ptr, len, label) {
+function dumpGcmField(ptr, len, label) {   // nonces/tags are small
   if (ptr && !ptr.isNull() && len > 0 && len <= 64) dumpKey(ptr, len, label);
+}
+
+function dumpPayload(ptr, len, label) {    // record plaintext/ciphertext (can be large)
+  if (ptr && !ptr.isNull() && len > 0 && len <= 65536) dumpKey(ptr, len, label);
 }
 
 const TARGETS = {
@@ -101,13 +105,13 @@ Object.keys(TARGETS).forEach(function (mod) {
         // BCryptEncrypt(hKey, pbInput, cbInput, *pad, pbIV, cbIV, pbOutput, ...)
         if (this.fn === 'BCryptEncrypt') {
           const cin = readLen(args[2], 65536);
-          dumpGcmField(args[1], cin, 'PLAINTEXT-OUT');
+          dumpPayload(args[1], cin, 'PLAINTEXT-OUT');
           const g = gcmInfo(args[3]);
           if (g) dumpGcmField(g.pbNonce, g.cbNonce, 'gcm.nonce.out');
         }
         if (this.fn === 'BCryptDecrypt') {
           const cin = readLen(args[2], 65536);
-          dumpGcmField(args[1], cin, 'CIPHERTEXT-IN');    // wire bytes (17 03 03 body)
+          dumpPayload(args[1], cin, 'CIPHERTEXT-IN');    // wire bytes (17 03 03 body)
           const g = gcmInfo(args[3]);
           if (g) {
             dumpGcmField(g.pbNonce, g.cbNonce, 'gcm.nonce.in');
@@ -145,7 +149,7 @@ Object.keys(TARGETS).forEach(function (mod) {
         // the GCM tag was written into the mode-info struct by the call.
         if (this.fn === 'BCryptEncrypt') {
           const cin = readLen(this.a[2], 65536);
-          dumpGcmField(this.a[1], cin, 'CIPHERTEXT-OUT');
+          dumpPayload(this.a[1], cin, 'CIPHERTEXT-OUT');
           const g = gcmInfo(this.a[3]);
           if (g) dumpGcmField(g.pbTag, g.cbTag, 'gcm.tag.out');
         }

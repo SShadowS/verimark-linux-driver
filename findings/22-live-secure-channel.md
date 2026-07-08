@@ -121,11 +121,33 @@ final `[217]0x9e`.
 → This is the outbound half of the byte-map `21` left open. Maps opcode → operation;
 the exact arg/response struct fields per opcode are the remaining fill-in.
 
+## Cross-check — verified end-to-end (`tools/verify-gcm.py`)
+
+Two independent checks, both clean:
+
+- **A) self-consistency:** AES-256-GCM-decrypt each captured ciphertext with its
+  captured key+nonce → **361/361 records reproduce the plaintext, 0 mismatch**.
+  Confirms OUT uses the client-write key `f30f…`, IN uses server-write `a7fb…`.
+- **B) wire match:** the USBPcap **hub2** file holds **524 `17 03 03` records**
+  (== the 524 crypto ops). Taking the ciphertext straight off the wire, prepending
+  the 4-byte direction salt to the wire's 8-byte explicit nonce, and decrypting with
+  the session key → **480/480 matched the Frida plaintext, 0 unmatched** (the ~44
+  not matched are the 0-length / >64-B-capped records that carry no comparable
+  plaintext in this log).
+
+→ Proves: the extracted keys are correct; the record layout is exactly
+`17 03 03 ‖ len16 ‖ explicit_nonce[8] ‖ AES-256-GCM-ciphertext ‖ tag[16]` (textbook
+TLS 1.2 GCM); and there is **no application-layer wrapping under TLS** — the decrypted
+record body *is* the Tudor command/response. The VeriMark lives on USBPcap **hub2**.
+
+GCM plaintext recovery uses CTR from counter `nonce ‖ 0x00000002` (96-bit-IV GCM), so
+no AAD is needed for the plaintext check.
+
 ## Next
 1. ~~Re-capture with the fixed hook → outbound command **plaintext + nonce**.~~ ✅ done
    (this session). Opcode table above.
 2. Label OUT opcodes against the IOCTL/command surface in `21-command-reference.md`
    (map each request to its `On*` handler by response size + order).
-3. Decrypt the USBPcap `17 03 03` records with the dumped key+nonce; confirm ==
-   Frida plaintext (validates framing end-to-end).
+3. ~~Decrypt the USBPcap `17 03 03` records with the dumped key+nonce; confirm ==
+   Frida plaintext.~~ ✅ done — `tools/verify-gcm.py` A+B above (480/480 wire match).
 4. Feed the confirmed command/response byte-maps back into `20`/`21`.
