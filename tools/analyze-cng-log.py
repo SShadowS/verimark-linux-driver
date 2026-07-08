@@ -50,6 +50,7 @@ def shannon(b):
 
 def parse(path):
     streams = collections.defaultdict(list)   # label -> [bytes]
+    order = []                                 # ('OUT'|'IN', bytes) in true temporal order
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             m = _LINE.match(line)
@@ -60,10 +61,33 @@ def parse(path):
                 b = bytes.fromhex(hx)
             except ValueError:
                 continue
-            if len(b) != ln:            # length mismatch => truncated line, keep what we have
-                pass
             streams[label].append(b)
-    return streams
+            if label == "PLAINTEXT-OUT":
+                order.append(("OUT", b))
+            elif label == "PLAINTEXT-IN":
+                order.append(("IN", b))
+    return streams, order
+
+
+def pair_by_order(order):
+    """Pair each command with the next response in true log order; unmatched INs are
+    unsolicited interrupt events. Avoids the stream-zip misalignment when the two
+    directions have different counts (events inflate the IN side)."""
+    txs, events, pend = [], [], None
+    for d, b in order:
+        if d == "OUT":
+            if pend is not None:
+                txs.append((pend, None))    # a command with no response before the next
+            pend = b
+        else:
+            if pend is not None:
+                txs.append((pend, b))
+                pend = None
+            else:
+                events.append(b)
+    if pend is not None:
+        txs.append((pend, None))
+    return txs, events
 
 
 def classify(stream):
@@ -105,7 +129,7 @@ def main():
     ap.add_argument("--json", help="write full timeline as JSON here")
     args = ap.parse_args()
 
-    s = parse(args.log)
+    s, order = parse(args.log)
     if not any(s.values()):
         sys.exit("No CNG dump lines found - is this a win-capture.py log?")
 
@@ -131,40 +155,53 @@ def main():
             print(f"  {label:15} n={len(s[label]):4} rand~{mean:4.2f} [{kind}]"
                   f"  lens={dict(sorted(lens.items()))}{note}")
 
-    # --- request/response timeline ---
-    # prefer true plaintext for the command; fall back to ciphertext-labeled stream
-    outs = s["PLAINTEXT-OUT"] or s["CIPHERTEXT-OUT"]
-    ins = s["PLAINTEXT-IN"]
-    n = min(len(outs), len(ins))
+    # --- request/response timeline (paired in true log order) ---
+    txs, events = pair_by_order(order)
     out_is_plain = bool(s["PLAINTEXT-OUT"]) and classify(s["PLAINTEXT-OUT"])[0] == "structured"
-    print(f"\n=== {n} request/response transactions "
+    print(f"\n=== {len(txs)} transactions + {len(events)} unsolicited events "
           f"(OUT={'plaintext' if out_is_plain else 'CIPHERTEXT (old log)'}) ===")
-    nout, tout = s["gcm.nonce.out"], s["gcm.tag.out"]
     timeline = []
-    for i in range(n):
-        o, r = outs[i], ins[i]
+    for k, (o, r) in enumerate(txs):
         rec = {
-            "i": i,
-            "out_len": len(o), "out_hex": o.hex(),
-            "in_len": len(r), "in_hex": r.hex(),
-            "resp_words": decode_response(r),
+            "i": k, "op": (o[0] if o else None),
+            "out_len": len(o) if o else 0, "out_hex": o.hex() if o else "",
+            "in_len": len(r) if r else 0, "in_hex": r.hex() if r else "",
+            "resp_words": decode_response(r) if r else "",
         }
-        if i < len(nout):
-            rec["gcm_nonce_out"] = nout[i].hex()
         timeline.append(rec)
-        if i < args.limit:
+        if k < args.limit:
             opc = ("op=0x%02x " % o[0]) if (out_is_plain and o) else ""
-            nonce = (" nonce=%s" % nout[i].hex()) if i < len(nout) else ""
-            print(f"  [{i:3}] OUT({len(o):3}) {opc}{o[:16].hex()}"
-                  f"{'..' if len(o) > 16 else ''}{nonce}")
-            print(f"        IN ({len(r):3}) {r[:24].hex()}{'..' if len(r) > 24 else ''}"
-                  f"   u32le: {rec['resp_words']}")
-    if n > args.limit:
-        print(f"  ... {n - args.limit} more (use --limit / --json for all)")
+            print(f"  [{k:3}] OUT({rec['out_len']:3}) {opc}{(o[:16].hex() if o else '')}"
+                  f"{'..' if o and len(o) > 16 else ''}")
+            if r is not None:
+                print(f"        IN ({len(r):3}) {r[:24].hex()}{'..' if len(r) > 24 else ''}"
+                      f"   u32le: {rec['resp_words']}")
+            else:
+                print("        IN  (none before next command)")
+    if len(txs) > args.limit:
+        print(f"  ... {len(txs) - args.limit} more (use --limit / --json for all)")
+
+    # --- per-opcode summary (reliable once paired in order) ---
+    if out_is_plain:
+        print("\n=== per-opcode summary (cmd byte0) ===")
+        agg = collections.defaultdict(lambda: {"n": 0, "clens": collections.Counter(),
+                                               "rlens": collections.Counter()})
+        for o, r in txs:
+            if not o:
+                continue
+            a = agg[o[0]]
+            a["n"] += 1
+            a["clens"][len(o)] += 1
+            if r is not None:
+                a["rlens"][len(r)] += 1
+        for op in sorted(agg):
+            a = agg[op]
+            print(f"  0x{op:02x}  x{a['n']:<3} cmdlen={dict(sorted(a['clens'].items()))}"
+                  f"  resplen={dict(sorted(a['rlens'].items()))}")
 
     # --- distinct response shapes ---
     print("\n=== distinct response plaintexts (by first 8 bytes) ===")
-    shapes = collections.Counter(b[:8].hex() for b in ins)
+    shapes = collections.Counter(b[:8].hex() for b in s["PLAINTEXT-IN"])
     for pfx, cnt in shapes.most_common(15):
         print(f"  x{cnt:3}  {pfx}..")
 
