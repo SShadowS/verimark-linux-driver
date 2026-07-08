@@ -91,6 +91,11 @@ the **outbound command plaintext**. Commands are `opcode ‖ args`; responses ar
 `u16`-status framing above. Nonces are TLS-1.2 GCM: fixed 4-byte per-direction salt
 (`e8f299f0` out / `88104fcf` in) + 8-byte explicit nonce (random per record).
 
+> **Note:** the inferred names below are superseded by the byte-verified VCSFW mapping
+> in `23-command-bytemap.md` + `24-libfprint-map.md` (e.g. `0x86`=EVENT_CONFIG not frame
+> data; `0x87`=EVENT_READ; `0x9e`=DB2_GET_DB_INFO not "end"; `0x96`/`0x99` = the two
+> unmapped MOC commands). Kept here for the raw observation.
+
 Every operation is bracketed **`0x99` (begin) … `0x9e` (end)**. Opcodes seen (semantics
 inferred from position + the known action sequence — not yet from decompiled builders):
 

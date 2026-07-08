@@ -13,21 +13,25 @@ interrupt-IN **events** are interleaved (finger/keepalive) and paired out separa
 
 ## Command / response table (this session)
 
-| opcode | n | cmd len | resp len | args (template) | role (inferred) |
+Symbolic names are the confirmed Synaptics **VCSFW** opcodes (byte-verified against the
+`synaTudor@rev` reference — full mapping + evidence in `24-libfprint-map.md`).
+
+| opcode | VCSFW name | n | cmd len | resp len | args (template) |
 |---|---|---|---|---|---|
-| `0x19` | 2 | 1 | 68 | `19` | **get start-info / version** (session open + verify start) |
-| `0x99` | 3 | 13 | 2 / 177 | `99 01000000 00000000 0000` | **read object / enroll record** (177-B record = GUID+SID; status `0x0509` when none) |
-| `0x9e` | 3 | 2 | 40 | `9e 01` | **operation finalize** (ends each enroll/verify) |
-| `0x80` | 18 | 17 | 2 | `80 LEN 000000 01000000 01000008 010101 00` | **capture/frame config** (byte1 = size, 0x14/0x0c) |
-| `0x81` | 18 | 1 | 2 | `81` | **capture step / arm** (ack only) |
-| `0x86` | 102 | 37 | 66 | `86 SEQ 00.. SEQ 00..` (mostly zero, small seq at +1/+17) | **frame read / sample** (dominant during enroll; resp 66-B frame metadata) |
-| `0x87` | 50 | 9 | 18 | `87 XX 0020 0001 000000` | **frame-state poll** (resp carries a timestamp/counter) |
-| `0x96` | 18 | 5/13 | 82 / 6 / 2 | `96 XX 000000 …` | **frame finish / get metrics** (resp 82-B metrics) |
-| `0xa0` | 2 | 21 | 52 | `a0 02000000 ‖ id[16]` | **DB2 object query/get-info** (resp: child id[16] + `ffff…` sentinels) |
-| `0xa3` | 2 | 21 | 4 | `a3 01000000 ‖ id[16]` | **DB2 delete object** (id = the one `0xa0` returned; resp `00 00 03 00`) |
+| `0x19` | **GET_START_INFO** | 2 | 1 | 68 | `19` |
+| `0x80` | **FRAME_ACQ** | 18 | 17 | 2 | `80 LEN 000000 01000000 01000008 010101 00` (`<BIIHxBBBBB>`) |
+| `0x81` | **FRAME_FINISH** | 18 | 1 | 2 | `81` |
+| `0x86` | **EVENT_CONFIG** | 102 | 37 | 66 | `86 ‖ mask[32] ‖ u32` — event-mask, re-armed per cycle (`<B8II>`) |
+| `0x87` | **EVENT_READ** | 50 | 9 | 18 | `87 seq[2] 2000 01000000` (byte-exact `<BHHI>`) |
+| `0x96` | **unmapped MOC** | 18 | 5/13 | 82 / 6 / 2 | `96 XX 000000 …` — on-chip capture/enroll step (**RE gap**) |
+| `0x99` | **unmapped MOC** | 3 | 13 | 2 / 177 | `99 01000000 00000000 0000` — begin enroll/identify; 177-B resp = template GUID+SID; `0x0509` when none (**RE gap**) |
+| `0x9e` | **DB2_GET_DB_INFO** | 3 | 2 | 40 | `9e 01` (reads DB state after each op — *not* an "end" cmd) |
+| `0xa0` | **DB2_GET_OBJ_INFO** | 2 | 21 | 52 | `a0 02000000 ‖ id[16]` (resp: child id[16] + `ffff…` sentinels) |
+| `0xa3` | **DB2_DELETE_OBJ** | 2 | 21 | 4 | `a3 01000000 ‖ id[16]` (resp `00 00 03 00`) |
 
 `n` = count in this session. Response lengths are consistent per opcode once paired in
-true log order (the earlier stream-zip mixed events in and looked ragged).
+true log order (the earlier stream-zip mixed events in and looked ragged). **`0x96` and
+`0x99` are the only two opcodes not in any public RE — the genuine MOC gap to close.**
 
 ## Decoded structures
 
@@ -62,14 +66,18 @@ Matches the static `DeleteRecord (0x442034)` + secondary/confirm (`0x442064`) in
 ## Operation state machine (observed)
 
 ```
-open:     0x19 (startinfo)
-enroll:   0x99(begin) → { 0x80,0x81,0x86×n,0x87,0x96 }×cycles → 0x9e(finalize)   [×2 fingers]
+open:     0x19 GET_START_INFO
+enroll:   0x99(begin MOC) → { EVENT_CONFIG 0x86 → EVENT_READ 0x87 → FRAME_ACQ 0x80 →
+                              FRAME_FINISH 0x81 → 0x96(MOC step) }×cycles →
+          0x9e DB2_GET_DB_INFO   [×2 fingers]
 verify:   0x19 → 0x99 → capture loop → 0x9e
-delete:   ( 0xa0 query → 0xa3 delete ) × 2
+delete:   ( 0xa0 DB2_GET_OBJ_INFO → 0xa3 DB2_DELETE_OBJ ) × 2
 events:   44× 2-byte 0000 interrupt-IN (finger/keepalive), asynchronous
 ```
-18 capture cycles / ~9 samples per finger (guided enroll). Each cycle: config (`0x80`)
-→ arm (`0x81`) → read frames (`0x86`, several) → poll (`0x87`) → finish (`0x96`).
+18 capture cycles / ~9 samples per finger (guided enroll). The capture is
+**event-driven**: set the event mask (`EVENT_CONFIG`), read events (`EVENT_READ`),
+acquire+finish a frame (`FRAME_ACQ`/`FRAME_FINISH`), with the on-chip MOC step (`0x96`)
+and the enroll/identify session (`0x99`) — the two commands no public RE has mapped.
 
 ## VCSFW / libfprint cross-reference
 
