@@ -78,17 +78,20 @@ complete pure-Python Tudor driver + a native `libfprint/.../drivers/tudor.c` shi
 - **`0x96` + `0x99` now functionally mapped** (`23`, by phase-diffing the live capture):
   `0x96` = guided-enroll capture/update (coverage-bitmask progress), `0x99` = identify/
   match. Only their exact response-struct field offsets remain partial.
+- **Handshake now captured** (cold-start pcap, `22`): negotiated suite confirmed
+  **`0xC02E` TLS_ECDH_ECDSA_WITH_AES_256_GCM_SHA384**, 408-B ECDSA-P256 device cert,
+  65-B ClientKeyExchange. The establish-channel bytes are in hand.
 - **Must still capture/RE:**
-  1. **A fresh handshake + pairing** — our capture reused a cached TLS session (0
-     `16 03 03` records on hub2), so ClientHello/cert/`0x93` PAIR/`0x44` TLS_DATA are
-     unseen live. This is the one piece needed to *establish* the channel from scratch;
-     `synaTudor@rev` implements it, but our device's actual bytes are uncaptured.
+  1. The one-time **`0x93` PAIR** provisioning — only runs when the device is
+     *unpaired*, so a cold connect re-handshakes but doesn't re-pair. Would need a
+     `ResetOwnership`/unpair first to capture. `synaTudor@rev` implements pairing.
   2. A **control-transfer transport shim** (no bulk pipe on `047d`).
+  3. Exact field offsets of the `0x96`/`0x99` MOC response structs (partial).
 - **Not reusable:** upstream libfprint `synaptics` (wrong protocol).
 
-→ Net: this is **GO**. The crypto/transport is solved and open-source, and every
-command opcode is now identified. Remaining: one cold-start capture (handshake/pair) +
-a USB transport adapter + exact MOC struct offsets.
+→ Net: this is **GO**. Crypto + transport framing + every command opcode + the
+handshake suite are all identified. Remaining: capture the one-time PAIR (needs an
+unpair), write a USB control-transfer adapter, and pin the MOC struct offsets.
 
 ## Sources
 - synaTudor `rev` (reference impl + RE docs): https://github.com/Popax21/synaTudor/tree/rev — `pydrv/tudor/comm.py`, `rev/proto.txt`, `pydrv/tudor/{sensor,tls}/`

@@ -126,6 +126,33 @@ final `[217]0x9e`.
 → This is the outbound half of the byte-map `21` left open. Maps opcode → operation;
 the exact arg/response struct fields per opcode are the remaining fill-in.
 
+## Handshake (live wire — cold-start capture)
+
+A second capture with USBPcap running while the dongle was **unplugged + replugged**
+forced a fresh `OnConnectSecure`. The TLS 1.2 handshake is **cleartext on the wire**
+(`16 03 03` records, sent before ChangeCipherSpec), so USBPcap caught it regardless of
+Frida timing. Decoded from the VeriMark hub pcap:
+
+- **ClientHello — 6 cipher suites advertised:**
+  `0xC005` ECDH_ECDSA_AES256_CBC_SHA · **`0xC02E` ECDH_ECDSA_AES256_GCM_SHA384** ·
+  `0x003D` RSA_AES256_CBC_SHA256 · `0x008D` PSK_AES256_CBC_SHA ·
+  `0x00A8` PSK_AES256_GCM_SHA384 · `0x00A9` (PSK/DHE_PSK AES256_GCM). Matches
+  `synaTudor@rev` `proto.txt` exactly.
+- **ServerHello** selects **`0xC02E` = TLS_ECDH_ECDSA_WITH_AES_256_GCM_SHA384** — the
+  exact suite behind the AES-256-GCM session keys decoded above. Note it's **static
+  ECDH** (not ECDHE): the premaster is ECDH(client-ephemeral, server-cert ECDH key).
+- **Certificate** = **408-byte** device cert (ECDSA P-256; chains to *Microsoft ECC
+  Devices Root CA 2017* per `10`). Server-auth only.
+- **ClientKeyExchange** = **65 bytes** = the host's uncompressed P-256 point
+  (`04 ‖ X[32] ‖ Y[32]`).
+
+This is `20`'s statically-inferred handshake, now confirmed from live wire bytes — and
+it pins the negotiated suite. (Frida was on the pre-replug WUDFHost, so this new
+session's derived keys weren't dumped; not needed — the handshake is all cleartext.)
+
+Not yet captured: the VCSFW **`0x93` PAIR** provisioning (only runs when *unpaired*;
+this device is already paired, so a cold connect re-handshakes but does not re-pair).
+
 ## Cross-check — verified end-to-end (`tools/verify-gcm.py`)
 
 Two independent checks, both clean:

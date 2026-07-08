@@ -84,12 +84,12 @@ field layout of the 82-B/177-B response structs, and confirming a *failed* verif
 no-match response. Neither needs new hardware access to nail down precisely, but a
 targeted capture (below) would settle them.
 
-**⚠ Handshake NOT in this capture.** hub2 has **0** `16 03 03` handshake records — the
-session reused a **cached TLS session** (the WUDFHost stayed alive across runs, so the
-same keys `f30f…`/`a7fb…` persisted). The fresh handshake + pairing (ClientHello,
-ServerHello+Certificate, ClientKeyExchange, Finished; VCSFW `0x93` PAIR, `0x44`
-TLS_DATA) — the bytes a Linux driver needs to **establish** the channel from scratch —
-have never been captured live. A cold-start capture is the one genuinely missing piece.
+**Handshake:** this enroll/verify capture reused a **cached TLS session** (0 `16 03 03`
+records; keys `f30f…`/`a7fb…` persisted across runs). A separate **cold-start** capture
+(unplug+replug) then caught the fresh handshake on the wire — cipher suite list,
+negotiated **`0xC02E` ECDH_ECDSA_AES256_GCM_SHA384**, 408-B device cert, 65-B
+ClientKeyExchange — decoded in `22-live-secure-channel.md`. Still uncaptured: the
+one-time **`0x93` PAIR** provisioning (only runs when the device is *unpaired*).
 
 ## Operation state machine (observed)
 
