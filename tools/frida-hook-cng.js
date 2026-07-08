@@ -68,7 +68,11 @@ Object.keys(TARGETS).forEach(function (mod) {
     Interceptor.attach(addr, {
       onEnter: function (args) {
         this.fn = fn;
-        this.a = args;
+        // Snapshot the arg pointers now: frida's `args` proxy is only valid during
+        // onEnter. Reading it in onLeave throws "invalid operation" (frida 17), so
+        // we keep the NativePointers and dereference the output buffers on return.
+        this.a = [args[0], args[1], args[2], args[3], args[4],
+                  args[5], args[6], args[7], args[8], args[9]];
       },
       onLeave: function (retval) {
         out('[' + this.fn + '] ret=' + retval);
