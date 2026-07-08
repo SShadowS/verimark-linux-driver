@@ -55,6 +55,36 @@ def is_admin():
         return False
 
 
+def prepare_agent_tmp():
+    r"""Relocate the frida-agent drop dir so a LOCAL SERVICE target can load it.
+
+    Frida injects by writing frida-agent-<arch>.dll into %TEMP% and having the
+    target LoadLibrary it. Our %TEMP% is C:\Users\<me>\AppData\Local\Temp, which
+    the biometric WUDFHost (running as LOCAL SERVICE, S-1-5-19) cannot read - so
+    injection dies with 'refused to load frida-agent'. That, NOT Core Isolation,
+    is the usual blocker on this box.
+
+    Fix: point TMP/TEMP at a dir the service accounts can read+execute. We grant
+    RX (inheritable) to LOCAL SERVICE and NETWORK SERVICE and Full only to
+    Administrators - no standard-user write, so nobody can plant a DLL that a
+    privileged host would load. Must run before `import frida` (GLib caches the
+    tmp dir on first use).
+    """
+    d = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "verimark-frida")
+    os.makedirs(d, exist_ok=True)
+    acls = [
+        ["icacls", d, "/inheritance:r"],
+        ["icacls", d, "/grant", "*S-1-5-32-544:(OI)(CI)F"],   # Administrators: full
+        ["icacls", d, "/grant", "*S-1-5-19:(OI)(CI)(RX)"],    # LOCAL SERVICE: read+exec
+        ["icacls", d, "/grant", "*S-1-5-20:(OI)(CI)(RX)"],    # NETWORK SERVICE: read+exec
+    ]
+    for cmd in acls:
+        subprocess.run(cmd, capture_output=True, text=True)
+    for var in ("TMP", "TEMP", "TMPDIR"):
+        os.environ[var] = d
+    return d
+
+
 def find_pids():
     """Return (verimark_pids, all_candidates) as lists of (pid, path)."""
     out = subprocess.run(
@@ -159,6 +189,10 @@ def main():
               "    'Administrator: PowerShell' and re-run this.")
         return 2
 
+    agent_tmp = prepare_agent_tmp()
+    print(f"[*] frida-agent tmp: {agent_tmp} (RX granted to LOCAL/NETWORK SERVICE so "
+          f"the biometric WUDFHost can load it)")
+
     try:
         import frida
     except ImportError:
@@ -176,14 +210,23 @@ def main():
     installed = {"n": 0}
 
     def on_message(msg, data):
-        if msg.get("type") == "send":
-            emit("[send] " + str(msg["payload"]))
-        elif msg.get("type") == "log":
+        t = msg.get("type")
+        if t == "send":
+            # The hook routes all its output through send() (frida 17 does not
+            # deliver console.log to this handler), so payloads are plain strings.
+            text = msg.get("payload")
+            if isinstance(text, str):
+                if text.startswith("hooked "):
+                    installed["n"] += 1
+                emit(text)
+            else:
+                emit("[send] " + str(text))
+        elif t == "log":
             text = msg.get("payload", "")
             if text.startswith("hooked "):
                 installed["n"] += 1
             emit(text)
-        elif msg.get("type") == "error":
+        elif t == "error":
             emit("[frida-error] " + str(msg.get("stack") or msg))
 
     # --- attach (this is the step that fails on VBS/protected-host machines) ---
@@ -194,12 +237,18 @@ def main():
             script = session.create_script(f.read())
         script.on("message", on_message)
         script.load()
-    except frida.ProcessNotRespondingError:
-        emit("[X] Frida could not inject the biometric WUDFHost.")
-        emit("    This box protects the fingerprint host (Core Isolation / VBS is ON).")
-        emit("    FIX: Windows Security > Device security > Core isolation >")
-        emit("         turn OFF 'Memory integrity', reboot, and re-run.")
-        emit("    (Turning off antivirus does NOT help - it's Core Isolation that blocks this.)")
+    except frida.ProcessNotRespondingError as e:
+        emit(f"[X] Frida could not inject the biometric WUDFHost (PID {pid}): {e}")
+        emit("    Ranked likely causes (agent-tmp perms already handled above):")
+        emit("    1) HVCI / 'Memory integrity' ON - blocks the unsigned agent load.")
+        emit("       Check: Windows Security > Device security > Core isolation.")
+        emit("       Verify: powershell \"(Get-CimInstance -Namespace root/Microsoft/Windows/"
+             "DeviceGuard Win32_DeviceGuard).SecurityServicesRunning\"  (a '2' means HVCI is on).")
+        emit("    2) Target is a Protected Process (PPL) - injection is impossible; pick the")
+        emit("       right WUDFHost with --pid (the umdf\\synawudfbiousb one, not 06cb:0126).")
+        emit("    3) AV/EDR blocking CreateRemoteThread/LoadLibrary in the host.")
+        emit("    (Agent-load perms for the LOCAL SERVICE host are pre-fixed via prepare_agent_tmp;")
+        emit("     if you still see 'refused to load frida-agent', it's #1 above.)")
         logf.close()
         return 3
 

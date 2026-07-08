@@ -11,6 +11,11 @@
 // plaintext fingerprint protocol. Enroll/verify a finger while this is attached.
 'use strict';
 
+// Frida 17 auto-prints console.log to the injector's stdout but does NOT deliver
+// it to the Python message handler, so it never reaches the capture logfile.
+// Route everything through send() so win-capture.py persists the key material.
+function out(line) { send(line); }
+
 function hex(buf) {
   return Array.prototype.map
     .call(new Uint8Array(buf), b => ('0' + b.toString(16)).slice(-2))
@@ -19,10 +24,10 @@ function hex(buf) {
 
 function dumpKey(ptr, len, label) {
   try {
-    const data = Memory.readByteArray(ptr, len);
-    if (data) console.log('  ' + label + ' (' + len + '): ' + hex(data));
+    const data = ptr.readByteArray(len);
+    if (data) out('  ' + label + ' (' + len + '): ' + hex(data));
   } catch (e) {
-    console.log('  (' + label + ' dump failed: ' + e + ')');
+    out('  (' + label + ' dump failed: ' + e + ')');
   }
 }
 
@@ -57,7 +62,8 @@ const TARGETS = {
 
 Object.keys(TARGETS).forEach(function (mod) {
   TARGETS[mod].forEach(function (fn) {
-    const addr = Module.findExportByName(mod, fn);
+    const m = Process.findModuleByName(mod);
+    const addr = m ? m.findExportByName(fn) : null;
     if (!addr) return;
     Interceptor.attach(addr, {
       onEnter: function (args) {
@@ -65,7 +71,7 @@ Object.keys(TARGETS).forEach(function (mod) {
         this.a = args;
       },
       onLeave: function (retval) {
-        console.log('[' + this.fn + '] ret=' + retval);
+        out('[' + this.fn + '] ret=' + retval);
         // BCryptDeriveKey(hSecret, pwszKDF, *params, pbDerivedKey, cbDerivedKey, *pcbResult, flags)
         if (this.fn === 'BCryptDeriveKey' || this.fn === 'NCryptDeriveKey') {
           const pbuf = this.a[3];
@@ -106,11 +112,11 @@ Object.keys(TARGETS).forEach(function (mod) {
         }
       },
     });
-    console.log('hooked ' + mod + '!' + fn);
+    out('hooked ' + mod + '!' + fn);
   });
 });
 
-console.log('CNG hooks installed. Enroll/verify a finger on Windows now.');
-console.log('Key material: symKeySecret / derivedKey.  Plaintext protocol: PLAINTEXT-OUT/-IN.');
-console.log('Tip: also capture USB with Wireshark+USBPcap; feed the dumped key');
-console.log('     into Wireshark or tools/decode-tls-records.py to decrypt the 17 03 03 records.');
+out('CNG hooks installed. Enroll/verify a finger on Windows now.');
+out('Key material: symKeySecret / derivedKey.  Plaintext protocol: PLAINTEXT-OUT/-IN.');
+out('Tip: also capture USB with Wireshark+USBPcap; feed the dumped key');
+out('     into Wireshark or tools/decode-tls-records.py to decrypt the 17 03 03 records.');
