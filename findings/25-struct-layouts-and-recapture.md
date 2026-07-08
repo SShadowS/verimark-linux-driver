@@ -1,0 +1,122 @@
+# 25 — Struct layouts (offline-extracted) + pre-move recapture checklist
+
+**Date:** 2026-07-08. Everything squeezable from the existing captures without the
+device, plus the short list of data that *does* need the dongle — to capture **before
+moving it to the Linux box**. Source: `captures/win-cng-4868.log` (enroll 2 + verify +
+delete) and the cold-start handshake pcap `win-usb-20260708-103815-hub2.pcap`. Analysis
+via `tools/analyze-cng-log.py` + `tools/verify-gcm.py`. Clean-room: observed bytes only.
+
+## Response struct layouts (per opcode)
+
+Offsets are byte offsets into the decrypted response; `u16`/`u32` are little-endian.
+All responses start with `u16 status` (`0x0000` = OK).
+
+**`0x19` GET_START_INFO (68 B, constant this FW):**
+```
++0  u16 status = 0000
++2  bytes      02 00 21 00 01 10     firmware/version + caps id
++24 u32        9b6beea7              fixed instance/build id (per-FW constant)
++28 …          zero-pad to 68
+```
+
+**`0x80` FRAME_ACQ / `0x81` FRAME_FINISH:** `0000` — status-only ack (2 B).
+
+**`0x86` EVENT_CONFIG (66 B) — actually returns an EVENT record:**
+```
+const block at +36:  06 cc 80 2f … a0 86 01 00 1f 00 00 00   (fixed device/sensor signature)
+variable at +2,+5,+18,+21,+64  = event-specific counters/flags
+```
+
+**`0x87` EVENT_READ (18 B):**
+```
++0  u16 status = 0000
++2  u32 = 00000001
++6..12  event payload (timestamp/seq — varies)
++13 u32 = 0000000a
+```
+
+**`0x96` MOC enroll-step (82 B) — guided-enroll progress:**
+```
++0   u16 status
++18  u16 = 003c (const; frame geometry?)
++20  u8  COVERAGE BITMASK  (01→03→07→0f→1f→3f→7f as regions fill; 7f = complete)
++24  u8  sample counter    (0e,1c,2a,39,47,55 … ~+14/sample)
++41  u8  per-sample QUALITY (~0x63 ≈ 99)
+last sample (coverage=7f): front bytes carry real template feature data instead of zero
+```
+
+**`0x99` MOC identify (177 B on match) — template record:**
+```
++2   GUID[16]     template object id            (= the id deleted later)
++18  hdr/metrics  24 00.. 6f 00.. 0b 87.. …
++56  ffffffff     (empty/parent sentinel)
++66  GUID[16]     repeated object id
++86  01 00 4c000000 03000000 1c000000
++98  SID          0105000000000005 15.. <subauths> ..-1001   (host user, redacted)
+tail 02 00 01 00 00 00 <crc?>
+(no-match / enroll-dedup case: 2-byte 0x0509 status)
+```
+
+**`0x9e` DB2_GET_DB_INFO (40 B) — template store capacity/usage:**
+```
++0  u16 status
++4  u16 = 1      (version)
++8  u16 = 1
++12 u16 = 4
++14 u16 = 528    (0x0210 — store size?)
++16 u16 = 100    MAX TEMPLATE SLOTS
++18 u16 = 48
++22..38  live usage counters (used/free/dirty — change as templates add/delete)
+```
+
+**`0xa0` DB2_GET_OBJ_INFO (52 B):**
+```
++0  u32 status
++4  16×ff       parent/sentinel (unused)
++20 GUID[16]    the object id being reported (child)
++36 …0          reserved
++48 u32 = 0000910c   handle/flags
+```
+
+**`0xa3` DB2_DELETE_OBJ (4 B):** `0000 0300` — status + `0x0003` (remaining/type).
+
+## Handshake (from cold-start pcap)
+
+- **Suite:** ClientHello offers `C005 C02E 003D 008D 00A8 00A9`; server picks
+  **`0xC02E` TLS_ECDH_ECDSA_WITH_AES_256_GCM_SHA384** — **static ECDH** P-256 + ECDSA
+  cert. Premaster = ECDH(host-ephemeral-priv, device-cert-key).
+- **ClientHello** random `4b51af02…`; **ServerHello** random `00019f56…`, session-id
+  len 7.
+- **Certificate (400 B) is NOT X.509** — a **custom Synaptics container** (starts `a1 36
+  3f…`, ASN.1 context-tag-1; std DER parse fails). Holds the sensor EC public key +
+  ECDSA signature; parse with `synaTudor@rev`'s cert code.
+- **ClientKeyExchange (65 B):** host P-256 pubkey
+  `04 07816884d271…4559` (`04‖X[32]‖Y[32]`).
+- Frida did **not** dump this session's derived keys (replug → new WUDFHost; hook was on
+  the old PID). Not needed — the handshake is cleartext and a Linux driver derives its
+  own keys.
+
+## Pre-move recapture checklist (needs the dongle)
+
+Everything above is now offline-permanent. Capture these **before** the dongle leaves
+the Windows box (all non-destructive unless noted). Each: run `python
+tools\win-capture.py`, do the action, ENTER, then `analyze-cng-log.py`.
+
+| pri | what | how to trigger | why |
+|---|---|---|---|
+| **HIGH** | **`0x9f` DB2_GET_OBJ_LIST** (enumerate stored prints) | open Settings ▸ Sign-in ▸ Fingerprint (the page that *lists* enrolled fingers), or add/remove a finger so it re-lists | libfprint's `dev_list`/storage enumeration needs it; **not in any capture yet** |
+| **HIGH** | **`0xa1` DB2_GET_OBJ_DATA** (read a template payload) | same settings interactions / a verify that reads the template | template read path; unseen |
+| MED | **fresh handshake WITH keys** | needs Frida on the *new* WUDFHost at connect (PID race) — see note | validates TLS key-derivation end-to-end; optional (synaTudor derives it) |
+| MED | **failed verify** (no-match) | swipe an **unenrolled** finger during a verify | pins `0x99` no-match response (we only have the `0x0509` dedup case) |
+| LOW | **LED / indicator** (`OnSetIndicator`/`SetLEDState`) | any op that blinks the LED | only if the driver drives the LED |
+| LOW | **calibrate / sensor status** | plug-in / Windows Hello self-test | nice-to-have |
+| OPT (destructive) | **`0x93` PAIR** provisioning | `ResetOwnership`/unpair (**loses enrollments**) then re-enroll while capturing | this device's actual pairing bytes; `synaTudor@rev` already implements pairing, so skip unless needed |
+
+**To catch the fresh-handshake keys** (MED): the replug spawns a new host, so attach must
+beat `OnConnectSecure`. Options — (a) add a `--watch` spawn-gate to `win-capture.py` that
+polls for the new `synawudfbiousb` host and attaches within ms; (b) capture is
+USBPcap-only for the wire (already have that). Wire handshake is enough; the derived keys
+are validation-only.
+
+→ Net: only the **HIGH** rows (`0x9f`, `0xa1`) are worth a quick capture before the move;
+the rest are optional. After those, the device can go to Linux with no offline gap.
