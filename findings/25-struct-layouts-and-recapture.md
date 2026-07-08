@@ -102,21 +102,21 @@ Everything above is now offline-permanent. Capture these **before** the dongle l
 the Windows box (all non-destructive unless noted). Each: run `python
 tools\win-capture.py`, do the action, ENTER, then `analyze-cng-log.py`.
 
-| pri | what | how to trigger | why |
-|---|---|---|---|
-| **HIGH** | **`0x9f` DB2_GET_OBJ_LIST** (enumerate stored prints) | open Settings ▸ Sign-in ▸ Fingerprint (the page that *lists* enrolled fingers), or add/remove a finger so it re-lists | libfprint's `dev_list`/storage enumeration needs it; **not in any capture yet** |
-| **HIGH** | **`0xa1` DB2_GET_OBJ_DATA** (read a template payload) | same settings interactions / a verify that reads the template | template read path; unseen |
-| MED | **fresh handshake WITH keys** | needs Frida on the *new* WUDFHost at connect (PID race) — see note | validates TLS key-derivation end-to-end; optional (synaTudor derives it) |
-| MED | **failed verify** (no-match) | swipe an **unenrolled** finger during a verify | pins `0x99` no-match response (we only have the `0x0509` dedup case) |
-| LOW | **LED / indicator** (`OnSetIndicator`/`SetLEDState`) | any op that blinks the LED | only if the driver drives the LED |
-| LOW | **calibrate / sensor status** | plug-in / Windows Hello self-test | nice-to-have |
-| OPT (destructive) | **`0x93` PAIR** provisioning | `ResetOwnership`/unpair (**loses enrollments**) then re-enroll while capturing | this device's actual pairing bytes; `synaTudor@rev` already implements pairing, so skip unless needed |
+| pri | what | status |
+|---|---|---|
+| ~~HIGH~~ | **`0x9f` DB2_GET_OBJ_LIST** / **`0xa1` DB2_GET_OBJ_DATA** | **Confirmed NOT UI-reachable** — an add→verify→remove-all session never fired them (Windows enumerates only at internal WBF sync/connect). Use `synaTudor@rev`'s documented format; confirm live on Linux. |
+| ✅ done | **`0x39` LED_EX2** | captured incidentally (add-finger LED animation, below) |
+| ✅ done | **fresh handshake session keys** | the "Remove feature" restarted the WUDFHost (new PID 62340); Frida caught the **fresh session keys** (`3be9…`/`60b4…`), verified 300/300. The one-time ECDH *derivation* still wasn't dumped (attach beat the per-record keys but not the handshake), but the wire handshake (`22`) already covers structure. |
+| MED | **failed verify** (no-match) | swipe an **unenrolled** finger during verify → pins `0x99` no-match (we have the `0x0509` dedup case + a match case) |
+| OPT (destructive) | **`0x93` PAIR** | needs `ResetOwnership`/unpair (**loses enrollments**); `synaTudor@rev` implements pairing — skip unless needed |
 
-**To catch the fresh-handshake keys** (MED): the replug spawns a new host, so attach must
-beat `OnConnectSecure`. Options — (a) add a `--watch` spawn-gate to `win-capture.py` that
-polls for the new `synawudfbiousb` host and attaches within ms; (b) capture is
-USBPcap-only for the wire (already have that). Wire handshake is enough; the derived keys
-are validation-only.
+→ Net: **no offline gap remains that the UI can fill.** `0x9f`/`0xa1` come from
+`synaTudor@rev`; the handshake is captured; LED is captured. The device can move to Linux.
 
-→ Net: only the **HIGH** rows (`0x9f`, `0xa1`) are worth a quick capture before the move;
-the rest are optional. After those, the device can go to Linux with no offline gap.
+## `0x39` LED_EX2 (captured in the add-finger session, PID 62340)
+
+125-byte command, ×24 during one add-finger (LED feedback animation), response `0000`.
+Example: `39 00 71 02 00 ffff0000 05 7f 00 20 000000 00 7f7f 0000 0000 0000 ffff 0000 05 …`
+— carries LED animation frames (16-bit color/intensity fields). VCSFW `LED_EX2` per
+`synaTudor` `comm.py` (0x39). Only needed if the Linux driver drives the LED; the exact
+frame struct is not decoded (cosmetic).
