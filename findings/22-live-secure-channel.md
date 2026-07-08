@@ -84,8 +84,46 @@ Each record now yields `key + gcm.nonce + ciphertext + tag`. That is enough to
 they match the Frida plaintext — a cross-check that the extracted keys are right and
 that no application-layer wrapping sits under TLS.
 
+## Command opcodes (live, 2nd capture — with the fixed hook)
+
+The second session (open → enroll 2 fingers → verify/sign-in → delete both) captured
+the **outbound command plaintext**. Commands are `opcode ‖ args`; responses are the
+`u16`-status framing above. Nonces are TLS-1.2 GCM: fixed 4-byte per-direction salt
+(`e8f299f0` out / `88104fcf` in) + 8-byte explicit nonce (random per record).
+
+Every operation is bracketed **`0x99` (begin) … `0x9e` (end)**. Opcodes seen (semantics
+inferred from position + the known action sequence — not yet from decompiled builders):
+
+| opcode | len | count | where | inferred operation |
+|---|---|---|---|---|
+| `0x19` | 1 | 2 | session open, verify start | GET_VERSION / caps (resp 68 B) |
+| `0x99` | 13 | 3 | starts each op | **BEGIN / arm** (`99 01000000 00000000 0000`) |
+| `0x9e` | 2 | 3 | ends each op | **END / finalize** (`9e 01`) |
+| `0x80` | 17 | 18 | 1×/capture cycle | capture params / start-frame |
+| `0x81` | 1 | 18 | 1×/capture cycle | capture step ack |
+| `0x86` | 37 | 102 | capture loop | **frame / sample data** (bulk of enroll) |
+| `0x87` | 9 | 50 | capture loop | frame sub-step / poll |
+| `0x96` | 5/13 | 18 | 1×/capture cycle | cycle end / progress |
+| `0xa0` | 21 | 2 | delete | **DELETE template** (`a0 02000000 ‖ id[16]`) |
+| `0xa3` | 21 | 2 | delete | **DELETE confirm/secondary** (`a3 01000000 ‖ id[16]`) |
+
+- **18 capture cycles** (`0x80`/`0x81`/`0x96` ×18) across 2 fingers ≈ 9 samples/finger —
+  matches guided enroll. `0x86` (37 B) ×102 is the per-sample frame command.
+- **2 delete pairs** (`0xa0`+`0xa3`) at the tail, each carrying a distinct **16-byte
+  template id** — the two enrolled fingers. Two-step delete matches the static
+  `DeleteRecord` (`0x442034`) + secondary/confirm (`0x442064`) in `21`.
+- Response status was `0x0000` (OK) on every bracket/delete command.
+
+Phase segmentation (transaction index): open `[0]` · enroll-f1 `[9]0x99 … [95]0x9e` ·
+enroll-f2 `[105]0x99 … [191]0x9e` · verify `[193]0x19 … [212]` · delete `[213–216]` ·
+final `[217]0x9e`.
+
+→ This is the outbound half of the byte-map `21` left open. Maps opcode → operation;
+the exact arg/response struct fields per opcode are the remaining fill-in.
+
 ## Next
-1. Re-capture with the fixed hook → outbound command **plaintext + nonce**.
+1. ~~Re-capture with the fixed hook → outbound command **plaintext + nonce**.~~ ✅ done
+   (this session). Opcode table above.
 2. Label OUT opcodes against the IOCTL/command surface in `21-command-reference.md`
    (map each request to its `On*` handler by response size + order).
 3. Decrypt the USBPcap `17 03 03` records with the dumped key+nonce; confirm ==
