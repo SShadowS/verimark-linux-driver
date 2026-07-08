@@ -92,11 +92,11 @@ def strip_header(value: bytes) -> bytes:
 
 
 def parse_tagval(plain: bytes):
-    """TagVal TLV: [tag u16 BE][len u32 BE][data] * N."""
+    """TagVal TLV: [tag u16 LE][len u32 LE][data] * N (verified against a real blob)."""
     entries, i = [], 0
     while i + 6 <= len(plain):
-        tag = int.from_bytes(plain[i:i + 2], "big")
-        ln = int.from_bytes(plain[i + 2:i + 6], "big")
+        tag = int.from_bytes(plain[i:i + 2], "little")
+        ln = int.from_bytes(plain[i + 2:i + 6], "little")
         if ln > len(plain) - (i + 6):
             break
         entries.append({"tag": tag, "len": ln, "hex": plain[i + 6:i + 6 + ln].hex()})
