@@ -69,6 +69,12 @@ content.
   runtime). See CROSS-MACHINE-OWNERSHIP-CAPTURE.md.
 
 ## 0x93 PAIR payload diff — Windows vs rev (2026-07-08)
+> **⚠ VOID — see findings/41.** This diff is apples-to-oranges: the "Windows" column is what Windows
+> **SENT** (wire), the "rev" column is findings/28's value = the cert the **SENSOR RETURNED** to rev
+> (`resp[2:402]`), a different field. rev already **sends** `cert_type=0`+DER (verified on Fedora);
+> the `type-2` is the **sensor's grant** to a second (non-owner) pairer. The cert_type patch below is
+> a no-op and cannot lift `0x0405`. The rest of this file (no `0x4f`/`0x10` builders; ownership is
+> factory/first-pairer state) stands. Everything from here to end-of-file is retracted.
 Extracted Windows' `0x93` host_cert (400 B, pre-TLS cleartext) from the wire
 (`win-usb-20260708-222731-hub5.pcap`, dev 19) and compared to `rev`'s host_cert (findings/28):
 

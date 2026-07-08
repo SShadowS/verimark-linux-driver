@@ -1,5 +1,20 @@
 # Resume prompt — P2 authorization via host cert_type (Fedora/Linux box)
 
+> **⚠⚠ VOID — do NOT run this experiment. See `findings/41-cert-type-experiment-VOID.md`.**
+> The premise (patch rev to send `cert_type=0`) is dead: rev **already sends `cert_type=0`+DER** —
+> identical to Windows. The `type-2` we end up as is the **sensor's grant** to the second/non-owner
+> pairer (first-pairer-wins TOFU); Windows paired first = owner (`type-0`), Linux paired second =
+> secondary (`type-2`), and only the owner slot may run `0x96`/`0x99`. We do not control cert_type,
+> and reset (`0x10`) is owner-gated (`0x0401`, findings/36). 
+>
+> **The real decisive, non-destructive test is different:** pair a **factory-fresh 2nd VeriMark unit
+> FIRST from Linux** (before any Windows box touches it) → it should grant Linux `type-0` → enroll
+> works. That would prove Linux can own a virgin unit; existing Windows-owned units can't be taken
+> over without owner-gated reset. This file is kept only for history.
+
+---
+_(historical content below — the cert_type patch it describes is a no-op; ignore it)_
+
 Paste the block below into a fresh Claude Code session on the Linux box. It is self-contained:
 it names the state, the key finding, the ground-truth bytes (the Windows host_cert, since the raw
 captures are git-ignored and stay on the Windows box), the exact experiment, and how to verify.
