@@ -184,6 +184,9 @@ GO. Cipher modes `tlsSecurityTypeEcc` (ECDHE + ECDSA server cert) or PSK.
   padding(≤16). So the wire record is:
   `17 03 03 ‖ len16 ‖ IV[16] ‖ AES‑CBC(cmd) ‖ HMAC‑SHA256[32]`.
   Guarded by TLS-done state (`hSsiTls+0x558 == 7`).
+  **⚠ CORRECTED by live capture (`22-live-secure-channel.md`): the live channel is
+  AES-256-GCM (AEAD), not AES-CBC+HMAC — 0 records are 16-B aligned and `pbIV` is null.
+  The CBC layout above is a static-RE mis-inference; use GCM (nonce + 16-B tag).**
 
 ### Full command stack (driver → wire), now resolved
 

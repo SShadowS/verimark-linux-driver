@@ -29,6 +29,9 @@ CBiometricDevice::On*      (WBF adapter ops: connect/enroll/identify/delete)
 - **Master secret = 48 B** (`ssiTlsDataSet` tag `0x3d`, session/PSK cache).
 - **App-data record**: `17 03 03 ‖ len16 ‖ IV[16] ‖ AES-CBC(cmd) ‖ HMAC-SHA256[32]`
   — `ssiTlsWrap` overhead exactly `0x45` (69 B). Gated on TLS-done (`+0x558==7`).
+  **⚠ CORRECTED by live capture (`22-live-secure-channel.md`): the channel is actually
+  AES-256-GCM (AEAD, nonce+16-B tag), NOT AES-CBC+HMAC — no records are block-aligned
+  and `pbIV` is null. Treat the CBC framing here as superseded.**
 - Primitives: CNG `bcrypt` ECDH(P-256)/ECDSA/AES + `crypt32` (DPAPI at rest). **No
   ncrypt/TPM.** Host keypair ephemeral, self-generated (`tudorSecurityGenHostKeyPair`).
 
