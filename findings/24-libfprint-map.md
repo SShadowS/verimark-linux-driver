@@ -75,13 +75,20 @@ complete pure-Python Tudor driver + a native `libfprint/.../drivers/tudor.c` shi
   ECDHE-ECDSA-AES256-GCM handshake, record framing (`0x44` TLS_DATA), pairing (`0x93`),
   start-info (`0x19`), event/frame capture (`0x80/0x81/0x86/0x87`), DB2 storage incl.
   delete (`0x9e/0x9f/0xa0/0xa1/0xa3/0xa5`).
-- **Must still RE:** exactly **`0x96` + `0x99`** (the MOC enroll/identify session
-  commands) and their response structs, **plus a control-transfer transport shim**.
-  Nobody public has mapped `0x96/0x99`; our `synaFpAdapter132.dll` RE is the lead.
+- **`0x96` + `0x99` now functionally mapped** (`23`, by phase-diffing the live capture):
+  `0x96` = guided-enroll capture/update (coverage-bitmask progress), `0x99` = identify/
+  match. Only their exact response-struct field offsets remain partial.
+- **Must still capture/RE:**
+  1. **A fresh handshake + pairing** — our capture reused a cached TLS session (0
+     `16 03 03` records on hub2), so ClientHello/cert/`0x93` PAIR/`0x44` TLS_DATA are
+     unseen live. This is the one piece needed to *establish* the channel from scratch;
+     `synaTudor@rev` implements it, but our device's actual bytes are uncaptured.
+  2. A **control-transfer transport shim** (no bulk pipe on `047d`).
 - **Not reusable:** upstream libfprint `synaptics` (wrong protocol).
 
-→ Net: this is **GO**. The crown-jewel crypto/transport is solved and open-source; the
-remaining work is a bounded RE of two MOC opcodes + a USB transport adapter.
+→ Net: this is **GO**. The crypto/transport is solved and open-source, and every
+command opcode is now identified. Remaining: one cold-start capture (handshake/pair) +
+a USB transport adapter + exact MOC struct offsets.
 
 ## Sources
 - synaTudor `rev` (reference impl + RE docs): https://github.com/Popax21/synaTudor/tree/rev — `pydrv/tudor/comm.py`, `rev/proto.txt`, `pydrv/tudor/{sensor,tls}/`

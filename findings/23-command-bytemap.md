@@ -23,8 +23,8 @@ Symbolic names are the confirmed Synaptics **VCSFW** opcodes (byte-verified agai
 | `0x81` | **FRAME_FINISH** | 18 | 1 | 2 | `81` |
 | `0x86` | **EVENT_CONFIG** | 102 | 37 | 66 | `86 ‖ mask[32] ‖ u32` — event-mask, re-armed per cycle (`<B8II>`) |
 | `0x87` | **EVENT_READ** | 50 | 9 | 18 | `87 seq[2] 2000 01000000` (byte-exact `<BHHI>`) |
-| `0x96` | **unmapped MOC** | 18 | 5/13 | 82 / 6 / 2 | `96 XX 000000 …` — on-chip capture/enroll step (**RE gap**) |
-| `0x99` | **unmapped MOC** | 3 | 13 | 2 / 177 | `99 01000000 00000000 0000` — begin enroll/identify; 177-B resp = template GUID+SID; `0x0509` when none (**RE gap**) |
+| `0x96` | **MOC enroll-step** | 18 | 5/13 | 82 / 6 / 2 | `96 02000000` — enroll capture/update; 82-B resp = coverage bitmask + quality (see below) |
+| `0x99` | **MOC identify** | 3 | 13 | 2 / 177 | `99 01000000 00000000 0000` — identify/match; 177-B resp = matched template GUID+SID, `0x0509` = no match (see below) |
 | `0x9e` | **DB2_GET_DB_INFO** | 3 | 2 | 40 | `9e 01` (reads DB state after each op — *not* an "end" cmd) |
 | `0xa0` | **DB2_GET_OBJ_INFO** | 2 | 21 | 52 | `a0 02000000 ‖ id[16]` (resp: child id[16] + `ffff…` sentinels) |
 | `0xa3` | **DB2_DELETE_OBJ** | 2 | 21 | 4 | `a3 01000000 ‖ id[16]` (resp `00 00 03 00`) |
@@ -62,6 +62,34 @@ subject id; the sensor just stores/returns them. Nothing TPM-sealed.
 **Delete flow (per finger):** `0xa0 02000000 ‖ objId` → response returns a child id
 `3b79344a…`; then `0xa3 01000000 ‖ 3b79344a…` deletes it. Two pairs = the two fingers.
 Matches the static `DeleteRecord (0x442034)` + secondary/confirm (`0x442064`) in `21`.
+
+**`0x96` MOC enroll-step (82-B response) — the two "unmapped" MOC opcodes, cracked by
+phase-diffing this capture.** Across the 7 enroll samples of one finger, a byte at
+resp offset +21 walks `01 → 03 → 07 → 0f → 1f → 3f → 7f` — a **coverage bitmask
+filling up** (each accepted sample sets one more region bit; `0x7f` = all 7 regions =
+enroll complete). A counter at +25 climbs `0e,1c,2a,39,47,55` and a per-sample quality
+at +41 sits ~`0x63` (≈99). On the final (complete) sample the response front-loads real
+template feature bytes instead of zeros. So `0x96` is the **guided-enroll capture/update
+step**, response = progress feedback — the MOC twin of `UpdateEnrollment (0x442010)` in
+`21` (which also carries a region-coverage bitmask).
+
+**`0x99` MOC identify.** Same 13-byte command every time, but the response tells the
+function: during **enroll** it returns `0x0509` (LE status = "no match / proceed"),
+during **verify** it returns the **177-byte matched template record** (GUID + host SID,
+as decoded above). So `0x99` is an **identify/match** run — used for enroll
+dedup-check *and* verify — the MOC twin of `IdentifyFeatureSet (0x442058)` in `21`.
+
+→ Both opcodes are now functionally mapped (not just named). Still partial: the exact
+field layout of the 82-B/177-B response structs, and confirming a *failed* verify's
+no-match response. Neither needs new hardware access to nail down precisely, but a
+targeted capture (below) would settle them.
+
+**⚠ Handshake NOT in this capture.** hub2 has **0** `16 03 03` handshake records — the
+session reused a **cached TLS session** (the WUDFHost stayed alive across runs, so the
+same keys `f30f…`/`a7fb…` persisted). The fresh handshake + pairing (ClientHello,
+ServerHello+Certificate, ClientKeyExchange, Finished; VCSFW `0x93` PAIR, `0x44`
+TLS_DATA) — the bytes a Linux driver needs to **establish** the channel from scratch —
+have never been captured live. A cold-start capture is the one genuinely missing piece.
 
 ## Operation state machine (observed)
 
