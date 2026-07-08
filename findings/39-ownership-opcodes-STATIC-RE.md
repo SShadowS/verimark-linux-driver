@@ -67,3 +67,32 @@ content.
   first-ever enroll — to capture the first-time `0x3f`/`0x41` host-partition writes with correct
   content (the "TagVal container" findings/30 needed). NOT `0x4f`/`0x10` (they don't exist at
   runtime). See CROSS-MACHINE-OWNERSHIP-CAPTURE.md.
+
+## 0x93 PAIR payload diff — Windows vs rev (2026-07-08)
+Extracted Windows' `0x93` host_cert (400 B, pre-TLS cleartext) from the wire
+(`win-usb-20260708-222731-hub5.pcap`, dev 19) and compared to `rev`'s host_cert (findings/28):
+
+| field | Windows (enroll-authorized) | rev (gets 0x0405) |
+|---|---|---|
+| magic @0x00 | `3f5f` | `3f5f` (same) |
+| **cert_type @0x8c** | **0** | **2** |
+| **sign_size @0x8e** | **72** | **32** |
+| signature @0x90 | **DER ECDSA** (`30 46 0221…0221…`) | 32-byte raw |
+
+(The `sign_size=72` @0x8e exactly matches the DER SEQUENCE length observed at 0x90, confirming those
+offsets.) ⇒ **The enroll-authorization difference is the host cert: Windows presents `cert_type=0`
+with a real DER ECDSA signature; `rev` presents `cert_type=2` with a 32-byte sig.** This confirms
+findings/30's "does an enroll-authorized host need a different cert type" — yes. Likely `type-0` =
+"primary/owner host", `type-2` = "limited/secondary".
+
+**Unresolved here:** the host cert embeds no raw uncompressed P-256 point at the guessed offsets
+(pubkey is compressed/encoded), so the self-signed-vs-factory-signed test needs `rev`'s `Cert`
+parser (Fedora). Strong prior it is **self-signed by the host's own key** (findings/DECISION: no
+TPM/factory secret; TOFU) ⇒ reproducible.
+
+### Cheap Linux test (do FIRST, before machine 3 — Fedora, non-destructive)
+Patch `rev`'s pairing to emit the host cert as **`cert_type=0` with a DER-encoded ECDSA
+self-signature** (instead of `type=2`/raw-32), re-pair (`0x93`), then retry `0x96`/`0x99`. If the
+`0x0405` gate lifts, that was the whole fix — no ownership command, no destructive step, no second
+machine. If it still fails, the remaining piece is the first-time `0x3f`/`0x41` host-partition
+content → then the fresh-host (machine 3) capture earns its keep.
