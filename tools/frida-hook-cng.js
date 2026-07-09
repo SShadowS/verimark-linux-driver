@@ -87,6 +87,14 @@ const TARGETS = {
     'BCryptEncrypt',
     'BCryptDecrypt',
     'BCryptImportKeyPair',
+    // Cheap insurance for the pairing/host-cert path: the host self-signs its
+    // ephemeral cert before the 0x93 pair. BCryptSignHash's pbInput (the hash
+    // being signed) is cleartext here; the sign/keygen calls also mark exactly
+    // when the host identity is minted. These never pass through the wire capture.
+    'BCryptSignHash',              // pbInput (arg2) = the hash being self-signed
+    'BCryptVerifySignature',
+    'BCryptGenerateKeyPair',
+    'BCryptFinalizeKeyPair',
   ],
   'ncrypt.dll': [
     'NCryptSecretAgreement',
@@ -122,6 +130,12 @@ function armAll() {
             dumpPayload(args[1], cin, 'PLAINTEXT-OUT');
             const g = gcmInfo(args[3]);
             if (g) dumpGcmField(g.pbNonce, g.cbNonce, 'gcm.nonce.out');
+          }
+          // BCryptSignHash(hKey, *pPaddingInfo, pbInput, cbInput, pbOutput, ...)
+          // pbInput is the hash the host is self-signing for its ephemeral cert.
+          if (this.fn === 'BCryptSignHash') {
+            const cin = readLen(args[3], 4096);
+            dumpPayload(args[2], cin, 'SIGN-HASH-IN');
           }
           if (this.fn === 'BCryptDecrypt') {
             const cin = readLen(args[2], 65536);

@@ -11,6 +11,13 @@ ghidra-projects/
 *.key
 # Host pairing identity (contains the host EC private key) — local secret, never commit.
 prototype/pdata/
+# Extracted Windows OWNER pairing material (owner EC private key) — local secret, never commit.
+pairing-fields.json
+plain.bin
+# Local Python venv (cryptography/pyusb for the prototype).
+.venv/
+# Full decrypted command transcripts (embed the Windows user SID) — local, never commit.
+reference/protocol/transcripts/
 # Raw byte dump extracted from the proprietary DLL (regenerable from Ghidra) — treat like re/.
 prototype/p256_params.bin
 prototype/images/
@@ -23,3 +30,4 @@ prototype/images/
 # Python bytecode
 __pycache__/
 *.pyc
+prototype/prints/

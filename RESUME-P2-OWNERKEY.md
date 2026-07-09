@@ -1,5 +1,14 @@
 # Resume prompt — P2 via owner-key impersonation (Fedora/Linux box)
 
+> **RESOLVED 2026-07-09 — DONE, SOUND NEGATIVE. Do not re-run.** Executed in full: owner keypair
+> built + presented, TLS established as owner, but `0x96 01` still `0x0405` / `0x50` still `0x0401`.
+> Verified the sensor really authenticated us as owner (wrong-priv → remote `ILLEGAL_PARAMETER`) and
+> that pid-2 is shared scratch (not the gate). The MOC gate is a sensor-side ownership STATE from the
+> NiseCore provisioning transaction, not the keypair. **The non-destructive owner-key path is
+> exhausted.** Full writeup: `findings/43`. Builder: `prototype/build_owner_pdata.py`; probe:
+> `p2_moc.py ownertest` (with `VERIMARK_PDATA`). Original plan retained below for the record.
+
+
 Paste the block below into a fresh Claude Code session on the Linux box. Prereq: copy
 `C:\ProgramData\verimark-extract\pairing-fields.json` (from the Windows box) to the Fedora box first
 — it holds the extracted **owner private key**, so move it securely and keep it out of git.

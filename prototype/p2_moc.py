@@ -34,12 +34,30 @@ PDATA_DIR = os.path.join(HERE, "pdata")
 PRINTS_DIR = os.path.join(HERE, "prints")
 
 # MOC command literals (findings/29)
-C_BEGIN_ID   = bytes.fromhex("99" + "01000000" + "00000000" + "0000")   # 0x99 begin-identify (13 B)
-C_ENR_CREATE = bytes.fromhex("96" + "01000000" + "00000000" + "0000")   # 0x96 create-enroll (13 B)
+C_BEGIN_ID   = bytes.fromhex("99" + "01000000" + "00000000" + "00000000")   # 0x99 begin-identify (13 B)
+C_ENR_CREATE = bytes.fromhex("96" + "01000000" + "00000000" + "00000000")   # 0x96 create-enroll (13 B)
 C_ENR_SAMPLE = bytes.fromhex("96" + "02000000")                          # 0x96 add-sample (5 B)
 C_ENR_COMMIT = bytes.fromhex("96" + "04000000")                          # 0x96 commit (5 B)
 C_FRAME_ACQ  = bytes.fromhex("800c000000010000000100000801010100")       # 0x80 FRAME_ACQ (17 B, arg 0x0c)
 C_FRAME_FIN  = bytes.fromhex("81")                                        # 0x81 FRAME_FINISH
+
+# 0x96 03 ENROLL_FINALIZE (124 B) — Windows issues this after the last add-sample and
+# before 0x96 04 commit; without it the stored template is unbound and never matches.
+# [19:35] carries the sensor-minted template-id (final add-sample resp[2:18]).
+# [49:77] is a Windows SID (opaque match-label per RE). The machine-specific subauthorities
+# are ZEROED here (S-1-5-21-0-0-0-1001 placeholder) so this file carries no real machine id.
+# The proven-working value came from the (git-ignored) capture 222730 l.1798; whether the
+# zeroed SID still matches is NOT yet re-verified on-device — check here first if enroll/verify
+# regresses. A real driver should build the SID from the local user instead of hardcoding one.
+WIN_FINALIZE = bytes.fromhex(   # [19:35]=template-id (overwritten at build), [49:77]=redacted SID
+    "9603000000000000006f000000000010000000452dec91881390e414eb6a58128e412101004c000000030000001c000000010500000000000515000000000000000000000000000000e903000000000000000000000000000000000000000000000000000000000000000000000000000000000000020001000000f5")
+
+
+def build_finalize(template_id):
+    """0x96 03 finalize with our sensor-minted template-id spliced into [19:35]."""
+    assert len(template_id) == 16, "template-id must be 16 B"
+    assert len(WIN_FINALIZE) == 124, "finalize template must be 124 B"
+    return WIN_FINALIZE[:19] + template_id + WIN_FINALIZE[35:]
 
 
 def u16(b, o=0): return struct.unpack_from("<H", b, o)[0]
@@ -56,9 +74,12 @@ def open_sensor():
 
 def tls_up(sensor, comm):
     sid = sensor.id.hex()
-    pfile = os.path.join(PDATA_DIR, "%s.pdata" % sid)
+    # VERIMARK_PDATA overrides the default pairing file (e.g. the owner-impersonation
+    # <sid>.owner.pdata from build_owner_pdata.py). Default = the P1 Linux non-owner pdata.
+    pfile = os.environ.get("VERIMARK_PDATA") or os.path.join(PDATA_DIR, "%s.pdata" % sid)
     if not os.path.exists(pfile):
         raise SystemExit("no pairing data at %s — run p1_pair.py first" % pfile)
+    print(">>> using pairing data: %s" % pfile)
     with open(pfile, "rb") as f:
         pdata = SensorPairingData.load(io.BytesIO(f.read()))
     sensor.initialize(pdata)
@@ -135,32 +156,43 @@ def capture_frame(sensor, comm, deadline, acq=C_FRAME_ACQ):
 
 
 def mode_enroll(sensor, comm):
+    tls_up(sensor, comm)
+    _run_enroll(sensor, comm)
+
+
+def _run_enroll(sensor, comm, skip_create=False):
+    """Post-TLS enroll choreography shared by mode_enroll and mode_ownerpair.
+    skip_create=True => the 0x96 01 create-enroll context is already open (caller
+    already sent it and got 0x0000), so skip the dedup+create prologue."""
     os.makedirs(PRINTS_DIR, exist_ok=True)
-    sid = tls_up(sensor, comm)
 
     print("\n>>> DB before:")
     _list(comm)
 
     overall_deadline = time.time() + 150
 
-    # dedup check needs a captured frame first (0x99 = identify-this-frame)
-    print("\n>>> TAP the sensor for the dedup check ...")
-    if not capture_frame(sensor, comm, min(time.time() + 30, overall_deadline),
-                         acq=bytes.fromhex("8014000000010000000100000801010100")):
-        raise SystemExit("no finger for dedup frame")
-    r = comm.send_command(C_BEGIN_ID, 2, raw=True)
-    print("    0x99 dedup -> 0x%04x %s" % (u16(r), "(no-match/proceed)" if u16(r) == 0x0509 else ""))
+    if not skip_create:
+        # dedup check needs a captured frame first (0x99 = identify-this-frame)
+        print("\n>>> TAP the sensor for the dedup check ...")
+        if not moc_capture(sensor, comm, min(time.time() + 30, overall_deadline),
+                           verbose=True, acq=C_FRAME_ACQ14):
+            raise SystemExit("no finger for dedup frame")
+        r = comm.send_command(C_BEGIN_ID, 2, raw=True)
+        print("    0x99 dedup -> 0x%04x %s" % (u16(r), "(no-match/proceed)" if u16(r) == 0x0509 else ""))
 
-    print(">>> create-enroll ...")
-    r = comm.send_command(C_ENR_CREATE, 6, raw=True)
-    if u16(r) != 0:
-        raise SystemExit("create-enroll failed: 0x%04x" % u16(r))
+        print(">>> create-enroll ...")
+        r = comm.send_command(C_ENR_CREATE, 6, raw=True)
+        if u16(r) != 0:
+            raise SystemExit("create-enroll failed: 0x%04x" % u16(r))
+    else:
+        print("\n>>> enroll context already open (0x96 01 create returned 0x0000); skipping dedup+create.")
 
     print("\n>>> GUIDED ENROLL — tap the sensor, lift, repeat. Coverage must reach 0x7f.\n")
     coverage, guid, samples = 0, None, 0
     while coverage != 0x7f and time.time() < overall_deadline:
         print("  [sample %d] TAP the sensor now ..." % (samples + 1))
-        if not capture_frame(sensor, comm, min(time.time() + 25, overall_deadline)):
+        if not moc_capture(sensor, comm, min(time.time() + 25, overall_deadline),
+                           verbose=True, acq=C_FRAME_ACQ):
             print("    (no finger detected; keep tapping)")
             continue
         # feed the captured frame to on-chip enroll
@@ -169,7 +201,7 @@ def mode_enroll(sensor, comm):
         if st != 0:
             print("    add-sample status=0x%04x (rejected) — try again" % st)
             continue
-        new_cov, counter, quality = resp[22], resp[24], resp[41]
+        new_cov, counter, quality = resp[22], resp[24], resp[42]
         if new_cov == coverage:
             print("    sample not accepted (coverage still 0x%02x) — reposition & tap again" % coverage)
             continue
@@ -177,13 +209,18 @@ def mode_enroll(sensor, comm):
         samples += 1
         print("    accepted: coverage=0x%02x  counter=0x%02x  quality=%d" % (coverage, counter, quality))
         if coverage == 0x7f:
-            guid = resp[4:20]
-            print("\n>>> COVERAGE COMPLETE. sensor-minted GUID = %s" % guid.hex())
+            guid = resp[2:18]
+            print("\n>>> COVERAGE COMPLETE. sensor-minted template-id = %s" % guid.hex())
 
     if coverage != 0x7f:
         raise SystemExit("enroll did not complete (coverage=0x%02x). Commit skipped." % coverage)
 
     comm.send_command(struct.pack("<BB", Command.DB2_GET_DB_INFO, 1), 0x28)   # informational
+    print(">>> finalize (0x96 03) ...")
+    r = comm.send_command(build_finalize(guid), 2, raw=True)
+    if u16(r) != 0:
+        raise SystemExit("finalize (0x96 03) failed: 0x%04x" % u16(r))
+    print(">>> finalized OK.")
     print(">>> commit ...")
     r = comm.send_command(C_ENR_COMMIT, 2, raw=True)
     if u16(r) != 0:
@@ -202,9 +239,17 @@ def mode_enroll(sensor, comm):
 
 def mode_verify(sensor, comm):
     tls_up(sensor, comm)
-    print("\n>>> VERIFY — TAP the finger to match ...")
-    if not capture_frame(sensor, comm, time.time() + 30,
-                         acq=bytes.fromhex("8014000000010000000100000801010100")):
+    print("\n>>> VERIFY — PRESS AND HOLD the finger to match (retries until a frame lands) ...")
+    deadline = time.time() + 45
+    got = False
+    for attempt in range(8):
+        if time.time() > deadline:
+            break
+        print("  [verify attempt %d] press and HOLD ..." % (attempt + 1))
+        if moc_capture(sensor, comm, min(time.time() + 20, deadline), verbose=True, acq=C_FRAME_ACQ14):
+            got = True
+            break
+    if not got:
         raise SystemExit("no finger for verify frame")
     r = comm.send_command(C_BEGIN_ID, 177, raw=True)
     st = u16(r)
@@ -244,32 +289,253 @@ EV_FRAME  = [24]       # frame-ready, event type 0x18 (mask 1<<24 = 0x01000000)
 C_FRAME_ACQ14 = bytes.fromhex("8014000000010000000100000801010100")
 
 
-def moc_capture(sensor, comm, deadline, verbose=False):
-    """Windows MOC frame-capture choreography (dedup cycle tx1-8):
-       arm[1,2] -> read finger ; arm[24] -> FRAME_ACQ -> read frame-ready(0x18) ; FRAME_FINISH.
-    Leaves a valid frame on-chip for the next MOC step. Returns True if 0x18 was seen."""
+def wait_intr_event(comm, deadline, kind):
+    """Block (bounded) until an interrupt-EP (0x83) event of type `kind` arrives.
+    Caller must have armed the event mask first. Returns seq byte or None on timeout.
+    On 047d:00f2 the 0x87 EVENT_READ poll does NOT surface the finger-press edge, but
+    the interrupt EP does — so both press (0x01) and frame-ready (0x18) are read here."""
+    raw = comm.proxied
+    while time.time() < deadline:
+        ev = read_intr(raw, 500)
+        if ev and len(ev) >= 1 and ev[0] == kind:
+            return ev[6] if len(ev) > 6 else 0
+    return None
+
+
+def moc_capture(sensor, comm, deadline, verbose=False, acq=C_FRAME_ACQ14):
+    """047d:00f2 MOC frame capture. Press AND frame-ready both via the interrupt EP
+    (0x87 EVENT_READ does not surface the 0x01 press edge on this device):
+       arm[1,2] -> wait press(0x01) ; arm[24] -> FRAME_ACQ -> wait frame-ready(0x18) ; FRAME_FINISH.
+    Leaves a valid frame on-chip for the next MOC step. True iff 0x18 frame-ready seen."""
     eh = sensor.event_handler
     def log(m):
         if verbose: print("      %s" % m)
-    # Arm finger events, then catch a fresh PRESS transition (finger down NOW).
-    eh.set_event_mask(EV_FINGER)
-    pressed = False
-    while time.time() < deadline:
-        t = evt_read(sensor, comm, min(time.time() + 4, deadline)); log("finger evt: %s" % t)
-        if 0x01 in t:
-            pressed = True; break
-        # re-arm baseline and keep waiting for the next tap
-        eh.set_event_mask([]); eh.set_event_mask(EV_FINGER)
-    if not pressed:
-        return False
-    # Finger is down — acquire immediately while it's held.
-    eh.set_event_mask([]); eh.set_event_mask(EV_FRAME)
-    comm.send_command(C_FRAME_ACQ14, 2)                       # FRAME_ACQ
-    t = evt_read(sensor, comm, min(time.time() + 4, deadline)); log("after FRAME_ACQ: %s" % t)
-    got_frame = 0x18 in t
+    eh.set_event_mask(EV_FINGER)                             # arm press/release on 0x83
+    if wait_intr_event(comm, deadline, FINGER_PRESS) is None:
+        log("no press"); return False
+    log("press")
+    # Frame-ready (0x18) is delivered via 0x87 EVENT_READ (Windows' channel), NOT the
+    # interrupt EP. Finger must stay DOWN through FRAME_ACQ for the scan to integrate.
+    eh.set_event_mask(EV_FRAME)                              # arm frame-ready (0x18)
+    comm.send_command(acq, 2)                                # FRAME_ACQ
+    got = False
+    fdl = min(time.time() + 5, deadline)
+    while time.time() < fdl:
+        t = evt_read(sensor, comm, min(time.time() + 1, fdl))
+        if t: log("frame evt: %s" % t)
+        if 0x18 in t:
+            got = True; break
+    log("frame-ready: %s" % ("yes" if got else "no"))
     eh.set_event_mask([])
-    comm.send_command(C_FRAME_FIN, 2)                         # FRAME_FINISH
-    return got_frame
+    comm.send_command(C_FRAME_FIN, 2)                        # FRAME_FINISH
+    return got
+
+
+def mode_ownertest(sensor, comm):
+    """DECISIVE, NO-FINGER ownership probe for the owner-impersonation path (findings/42).
+    Bring up TLS with whatever VERIMARK_PDATA points at, then hit the MOC auth gate WITHOUT
+    any frame: `0x96 01` create-enroll is auth-checked before frame-presence (it returned
+    0x0405 for our non-owner Linux host). No writes, no swipe.
+      status 0x0000  -> OWNER impersonation WORKS, MOC unblocked. (run enroll/verify next.)
+      status 0x0405  -> still host-not-authorized; owner keypair alone is insufficient.
+    """
+    tls_up(sensor, comm)
+    if not comm.proxied.remote_tls_status():
+        raise SystemExit("TLS did not establish with this pairing data")
+    print(">>> TLS established. Probing MOC auth gate (no finger)...\n")
+    r = comm.send_command(C_ENR_CREATE, 6, raw=True)
+    st = u16(r)
+    verdict = {0x0000: "OWNER AUTHORIZED — MOC unblocked",
+               0x0405: "host-not-authorized (owner key insufficient)"}.get(st, "unexpected")
+    print(">>> 0x96 01 create-enroll -> status=0x%04x  [%s]  raw=%s" % (st, verdict, r.hex()))
+    # If it opened, immediately close the enroll context we just created (no commit).
+    if st == 0x0000:
+        try:
+            rc = comm.send_command(C_ENR_COMMIT, 2, raw=True)
+            print(">>> (closed enroll ctx via 0x96 04 -> 0x%04x)" % u16(rc))
+        except Exception as e:
+            print(">>> (could not close enroll ctx: %r — harmless)" % e)
+    print("\n=== ownertest done ===")
+
+
+def mode_ownerpair(sensor, comm):
+    """WRITE (0x93 PAIR). Hyp-3 — the cheapest decisive test of the enroll gate:
+    re-pair the sensor with the EXTRACTED WINDOWS OWNER key (not a fresh key), then run the
+    full guided enroll. Rationale: mere owner-key TLS (findings/43, mode_ownertest) did NOT
+    lift the gate; here we drive the actual 0x93 re-pair transaction with the owner identity,
+    which syncs the sensor's host-partition/ownership state, and re-probe MOC.
+
+    Owner scalar is loaded from ../pairing-fields.json (tag-2, little-endian) — identical to
+    build_owner_pdata.py. The private scalar is never printed. Gated behind VERIMARK_CONFIRM=1.
+
+      0x96 01 create -> 0x0000  => Hyp-3 CONFIRMED (gate lifted); proceeds into guided enroll.
+      0x96 01 create -> 0x0405  => still host-not-authorized; Hyp-3 refuted.
+    """
+    import json
+    import cryptography.hazmat.primitives.asymmetric.ec as ecc
+
+    if os.environ.get("VERIMARK_CONFIRM") != "1":
+        raise SystemExit(
+            "REFUSING: `ownerpair` sends 0x93 PAIR (a WRITE) with the extracted owner key,\n"
+            "which re-pairs the sensor to that identity. Set VERIMARK_CONFIRM=1 to proceed, e.g.:\n"
+            "  sudo VERIMARK_CONFIRM=1 $PWD/.venv/bin/python prototype/p2_moc.py ownerpair")
+
+    infile = os.path.join(REPO, "pairing-fields.json")
+    if not os.path.exists(infile):
+        raise SystemExit("missing %s (extracted owner pairing fields)" % infile)
+    with open(infile) as f:
+        doc = json.load(f)
+    ents = {e["tag"]: bytes.fromhex(e["hex"]) for e in doc["entries"]}
+    priv_raw = ents[2]
+    assert len(priv_raw) == 32, "tag-2 priv scalar is %d B, expected 32" % len(priv_raw)
+    d = int.from_bytes(priv_raw, "little")             # Synaptics TagVal scalar is little-endian
+    owner_priv = ecc.derive_private_key(d, ecc.SECP256R1())
+    print(">>> loaded owner private key from %s (tag-2, LE)" % infile)   # never print the scalar
+
+    print("\n>>> WRITE — sending 0x93 PAIR with the OWNER key (re-pairs the sensor) ...")
+    pdata = sensor.pair_with_key(owner_priv)
+
+    # SELF-CHECK (diagnostic, non-fatal): sensor-returned host cert should byte-match the
+    # owner host cert stored as tag-1 (cert_type=2) in pairing-fields.json.
+    got = pdata.host_cert.tobytes()
+    ref = ents.get(1)
+    if ref is not None and got == ref:
+        print(">>> SELF-CHECK PASS: sensor-returned host cert == pairing-fields tag-1")
+    else:
+        print(">>> SELF-CHECK FAIL: host cert != tag-1 (diagnostic only, continuing)")
+        print("    got[:16]=%s  tag1[:16]=%s"
+              % (got[:16].hex(), ref[:16].hex() if ref is not None else "<none>"))
+
+    # persist the freshly-synced owner pdata (same serializer as build_owner_pdata.py)
+    os.makedirs(PDATA_DIR, exist_ok=True)
+    sid = sensor.id.hex()
+    out = os.path.join(PDATA_DIR, "%s.ownerpair.pdata" % sid)
+    buf = io.BytesIO(); pdata.save(buf)
+    with open(out, "wb") as f:
+        f.write(buf.getvalue())
+    print(">>> saved owner pdata -> %s" % out)
+
+    # bring up TLS over the freshly-synced owner storage
+    print(">>> initialize (TLS) over the owner pairing ...")
+    sensor.initialize(pdata)
+    if not comm.proxied.remote_tls_status():
+        raise SystemExit("TLS did not establish after owner re-pair")
+    print(">>> TLS established as owner.")
+
+    # COLD-GATE PROBE: 0x96 01 create-enroll before any finger (auth-checked pre-frame).
+    r = comm.send_command(C_ENR_CREATE, 6, raw=True)
+    st = u16(r)
+    print("\n>>> 0x96 01 create-enroll -> status=0x%04x  raw=%s" % (st, r.hex()))
+    if st == 0x0000:
+        print(">>> Hyp-3 CONFIRMED — MOC gate LIFTED by the owner re-pair. Proceeding to enroll.\n")
+        _run_enroll(sensor, comm, skip_create=True)
+    elif st == 0x0405:
+        print(">>> Hyp-3 REFUTED — still 0x0405 host-not-authorized after the owner re-pair.")
+    else:
+        print(">>> unexpected create status 0x%04x — not proceeding to enroll." % st)
+    print("\n=== ownerpair done ===")
+
+
+def mode_sessioninit(sensor, comm):
+    """Probe the 0x14 SESSION_INIT lead (reference/protocol/command-reference.json).
+    Windows sends 0x14 as the FIRST wrapped command every from-boot session (16 B =
+    `1400000c` + a fresh 12-B nonce); our Linux client has NEVER sent it. Test whether it
+    arms the channel for the MOC/cert gate. Non-destructive: 0x14 + re-checking the three
+    gated ops (0x50 / 0x99 01 / 0x96 01). No finger, no writes.
+
+    Verdict: if any gated op flips from 0x04xx to 0x0000/0x0509 after 0x14 -> 0x14 was the
+    missing session-arm. If they stay 0x0405/0x0401 -> the gate is host-identity, confirmed.
+    """
+    tls_up(sensor, comm)
+    if not comm.proxied.remote_tls_status():
+        raise SystemExit("TLS not established")
+
+    def gate_probe(label):
+        r = comm.send_command(struct.pack("<BB", 0x50, 0), 0x200, raw=True); c50 = u16(r)
+        r = comm.send_command(C_BEGIN_ID, 2, raw=True); c99 = u16(r)
+        r = comm.send_command(C_ENR_CREATE, 6, raw=True); c96 = u16(r)
+        if c96 == 0x0000:                       # unexpectedly opened -> close the enroll ctx
+            try: comm.send_command(C_ENR_COMMIT, 2, raw=True)
+            except Exception: pass
+        opened = (c50 == 0) or (c99 in (0, 0x0509)) or (c96 == 0)
+        print("    [%-14s] 0x50=0x%04x  0x99_01=0x%04x  0x96_01=0x%04x   %s"
+              % (label, c50, c99, c96, ">>> GATE OPENED <<<" if opened else "(still gated)"))
+        return opened
+
+    print("\n>>> BASELINE (before any 0x14):")
+    gate_probe("baseline")
+
+    trials = [
+        ("win-verbatim", bytes.fromhex("1400000c80eee60d2942013e411cc5f1")),
+        ("fresh-nonce",  bytes.fromhex("1400000c") + os.urandom(12)),
+        ("zero-nonce",   bytes.fromhex("1400000c") + bytes(12)),
+    ]
+    for name, cmd in trials:
+        print("\n>>> 0x14 SESSION_INIT [%s]: %s" % (name, cmd.hex()))
+        try:
+            r = comm.send_command(cmd, 32, raw=True)
+            print("    0x14 resp (%d B): %s   status=0x%04x" % (len(r), r.hex(), u16(r)))
+        except Exception as e:
+            print("    0x14 send error: %r" % e)
+        gate_probe("after-" + name)
+
+    print("\n=== sessioninit probe done ===")
+
+
+def mode_partsweep(sensor, comm):
+    """READ-ONLY sweep of ALL sensor storage partitions (not just pid-2), hunting for
+    owner-binding state or a Blackwing-style encrypted host-credential blob (findings/45).
+    Enumerate 0x3e descriptors, read each partition, report non-0xff content, Synaptics cert
+    magic (3f5f), and any TLV structure. Non-destructive."""
+    import hashlib
+    tls_up(sensor, comm)
+    print("\n>>> STORAGE_INFO (0x3e):")
+    r = comm.send_command(struct.pack("<B", 0x3e), 0x200, raw=True)
+    count = u16(r, 0x0e)
+    print("    status=0x%04x count=%d  raw=%s" % (u16(r), count, r[:0x10 + count * 12].hex()))
+    descs = []
+    for i in range(count):
+        o = 0x10 + i * 12
+        typ, flags = r[o], r[o + 1]
+        addr = struct.unpack_from("<I", r, o + 4)[0]
+        cap = struct.unpack_from("<I", r, o + 8)[0]
+        descs.append((typ, flags, addr, cap))
+        print("    desc[%d]: type=%d flags=%d flash_addr=0x%08x cap=%d" % (i, typ, flags, addr, cap))
+
+    for typ, flags, addr, cap in descs:
+        want = min(cap, 16384)     # full for the 4 KB partitions; a window for the big type-1
+        print("\n>>> READ partition pid=%d  (cap=%d, reading %d):" % (typ, cap, want))
+        raw = comm.send_command(struct.pack("<BBBHII", 0x40, typ, 0, 0xffff, 0, want),
+                                want + 0x20, raw=True)
+        st = u16(raw)
+        if len(raw) < 8:            # short response = error status, no data
+            print("    status=0x%04x  (short %d-B response — READ REFUSED, no data)" % (st, len(raw)))
+            continue
+        retlen = struct.unpack_from("<I", raw, 2)[0]
+        data = raw[8:8 + retlen]
+        nonff = sum(1 for b in data if b != 0xff)
+        non00 = sum(1 for b in data if b != 0x00)
+        print("    status=0x%04x  got=%d  non-0xff=%d  non-0x00=%d" % (st, len(data), nonff, non00))
+        if nonff == 0:
+            print("    (all 0xff — empty/unwritten)"); continue
+        print("    first 160B: %s" % data[:160].hex())
+        magics = [i for i in range(len(data) - 1) if data[i] == 0x3f and data[i + 1] == 0x5f]
+        if magics:
+            print("    !! Synaptics cert magic (3f5f) at offsets: %s" % magics[:8])
+        # try the host-partition TLV framing: [type:u16][len:u16][sha256:32][data]
+        off, n = 0, 0
+        while off + 0x24 <= len(data) and n < 12:
+            et, el = u16(data, off), u16(data, off + 2)
+            if et == 0 and el == 0:
+                break
+            if el == 0xffff or off + 0x24 + el > len(data):
+                break
+            edata = data[off + 36:off + 36 + el]
+            ok = "OK" if hashlib.sha256(edata).digest() == data[off + 4:off + 36] else "??"
+            print("      TLV[%d] type=%d len=%d sha=%s data=%s%s"
+                  % (n, et, el, ok, edata[:32].hex(), "…" if el > 32 else ""))
+            off += el + 0x24; n += 1
+    print("\n=== partsweep done (read-only) ===")
 
 
 def mode_probe1(sensor, comm):
@@ -610,7 +876,11 @@ def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "events"
     sensor, comm = open_sensor()
     try:
-        if mode == "events":   mode_events(sensor, comm)
+        if mode == "ownertest": mode_ownertest(sensor, comm)
+        elif mode == "ownerpair": mode_ownerpair(sensor, comm)
+        elif mode == "sessioninit": mode_sessioninit(sensor, comm)
+        elif mode == "partsweep": mode_partsweep(sensor, comm)
+        elif mode == "events": mode_events(sensor, comm)
         elif mode == "enroll": mode_enroll(sensor, comm)
         elif mode == "verify": mode_verify(sensor, comm)
         elif mode == "probe1": mode_probe1(sensor, comm)

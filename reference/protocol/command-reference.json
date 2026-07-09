@@ -1,0 +1,132 @@
+{
+  "_doc": "VeriMark Desktop (047d:00f2, Synaptics Tudor) MOC command reference: every decrypted VCSFW command observed on Windows vs. what our Linux prototype sends, with responses on both sides. Windows data from Frida CNG plaintext captures (captures/win-cng-*.log, 2026-07-08). Linux data from prototype/p2_moc.py + findings/28/30/43 (live on device). Status = first u16 LE of the decrypted response. See findings/44 for the analysis.",
+  "device": {"vid": "0x047d", "pid": "0x00f2", "sensor_id": "f7007ad929c60000", "fw": "10.1.3235317", "prov_state": 3},
+  "status_codes": {
+    "0x0000": "success",
+    "0x0401": "host-not-authorized (cert)",
+    "0x0404": "host-not-authorized (enroll add-sample)",
+    "0x0405": "host-not-authorized (MOC enroll/identify)",
+    "0x0509": "no-match / proceed (dedup during enroll)"
+  },
+  "divergence_summary": {
+    "identical_on_both_0x0000": ["0x19","0x80","0x81","0x82","0x86","0x87","0x93","0x9e","0x9f","0xa0","0xa3","0x3e","0x3f","0x40","0x41"],
+    "gated_on_linux_only": {
+      "0x50:GET_CERTIFICATE_EX": "Linux 0x0401; Windows never sends it (uses cert cached at setup)",
+      "0x99:01:IDENTIFY": "Windows 0x0509/0x0000, Linux 0x0405 on BYTE-IDENTICAL input",
+      "0x96:01:ENROLL-create": "Windows 0x0000, Linux 0x0405 on BYTE-IDENTICAL input"
+    },
+    "windows_only_never_sent_by_linux": {
+      "0x14:SESSION_INIT": "TESTED 2026-07-09: itself returns 0x0401 on Linux (all nonce variants) -> NOT a session-arm, it is in the 0x04xx gated family. Windows succeeds only because already authorized.",
+      "0x39:LED_EX2": "cosmetic LED feedback during swipe; auth-irrelevant",
+      "0x96:03:ENROLL-finalize": "binds template to Windows user SID; downstream of the 0x96:01 gate, never reachable by Linux"
+    },
+    "gated_family_0x04xx": ["0x14","0x50","0x96","0x99"],
+    "conclusion": "Every non-gated op returns 0x0000 on both -> our channel/framing are correct. The authorization-gated ops (0x14/0x50/0x99/0x96) return 0x04xx for Linux vs success for Windows on IDENTICAL input -> the sensor gates a whole command family on sensor-internal per-host authorization set at setup, not on payload/keypair/partition/session-arm. No host-sendable command lifts it (0x14 probe closed the last lead). findings/43, findings/44."
+  },
+  "commands": [
+    {"op": "0x14", "sub": "0x00", "name": "SESSION_INIT (per-session nonce handshake)",
+     "windows": {"sends": true, "cmd_len": 16, "cmd_sample": "1400000c80eee60d2942013e411cc5f1", "note": "1400000c fixed header + 12-B per-session nonce; sensor replies 1400000c + its own 12-B nonce (channel-binding handshake)", "resp_len": 16, "resp_status": "0x0014 (nonce-echo, authorized)"},
+     "linux": {"sends": true, "resp_status": "0x0401", "source": "p2_moc.py sessioninit (2026-07-09) — Windows-verbatim, fresh-nonce, and zero-nonce all -> 0x0401"},
+     "verdict": "DIVERGE — gated (host-not-authorized). TESTED: 0x14 is NOT a session-arm; it is itself in the 0x04xx family. Sending it does not lift 0x50/0x99/0x96."},
+
+    {"op": "0x19", "name": "GET_START_INFO",
+     "windows": {"sends": true, "cmd_len": 1, "cmd_sample": "19", "resp_len": 68, "resp_status": "0x0000"},
+     "linux": {"sends": true, "resp_status": "0x0000", "source": "findings/28 P1"},
+     "verdict": "MATCH"},
+
+    {"op": "0x39", "name": "LED_EX2",
+     "windows": {"sends": true, "cmd_len": 125, "cmd_sample": "3900710200ffff0000057f0020000000007f7f000000000000ffff0000057f0020000000", "subs": ["00","29","e8","f4","fa"], "resp_len": 2, "resp_status": "0x0000"},
+     "linux": {"sends": false, "resp_status": null, "note": "not sent — cosmetic LED"},
+     "verdict": "GAP (cosmetic, auth-irrelevant)"},
+
+    {"op": "0x80", "name": "FRAME_ACQ",
+     "windows": {"sends": true, "cmd_len": 17, "cmd_sample": "800c000000010000000100000801010100", "subs": ["0c","14"], "resp_len": 2, "resp_status": "0x0000"},
+     "linux": {"sends": true, "resp_status": "0x0000", "source": "p2_moc.py"},
+     "verdict": "MATCH"},
+
+    {"op": "0x81", "name": "FRAME_FINISH",
+     "windows": {"sends": true, "cmd_len": 1, "cmd_sample": "81", "resp_len": 2, "resp_status": "0x0000"},
+     "linux": {"sends": true, "resp_status": "0x0000"},
+     "verdict": "MATCH"},
+
+    {"op": "0x82", "name": "FRAME_STATE_GET",
+     "windows": {"sends": true, "cmd_len": 9, "cmd_sample": "820000000000000207", "resp_len": 34, "resp_status": "0x0000"},
+     "linux": {"sends": true, "resp_status": "0x0000", "source": "diag"},
+     "verdict": "MATCH"},
+
+    {"op": "0x86", "name": "EVENT_CONFIG",
+     "windows": {"sends": true, "cmd_len": 37, "cmd_sample": "860000000000000000000000000000000000000000000000000000000000000000040000", "subs": ["00","04","06"], "resp_len": 66, "resp_status": "0x0000"},
+     "linux": {"sends": true, "resp_status": "0x0000", "note": "layout per findings/30 (8 u32 slots, mask in slots 0&4)"},
+     "verdict": "MATCH"},
+
+    {"op": "0x87", "name": "EVENT_READ",
+     "windows": {"sends": true, "cmd_len": 9, "cmd_sample": "870000200001000000", "resp_len": 18, "resp_status": "0x0000", "note": "2nd byte = monotonic event seq"},
+     "linux": {"sends": true, "resp_status": "0x0000"},
+     "verdict": "MATCH"},
+
+    {"op": "0x93", "name": "PAIR",
+     "windows": {"sends": "pre-TLS (cleartext, not in CNG plaintext)", "cmd_len": 401, "note": "93 || host_cert[400]", "resp_len": 802, "resp_status": "0x0000"},
+     "linux": {"sends": true, "resp_status": "0x0000", "source": "findings/28 P1 — first sensor write"},
+     "verdict": "MATCH"},
+
+    {"op": "0x96", "sub": "0x01", "name": "ENROLL (create)",
+     "windows": {"sends": true, "cmd_len": 13, "cmd_sample": "96010000000000000000000000", "resp_len": 6, "resp_status": "0x0000"},
+     "linux": {"sends": true, "cmd_sample": "96010000000000000000000000", "resp_status": "0x0405", "source": "p2_moc.py ownertest — BYTE-IDENTICAL input"},
+     "verdict": "DIVERGE — gated (host-not-authorized)"},
+
+    {"op": "0x96", "sub": "0x02", "name": "ENROLL (add-sample)",
+     "windows": {"sends": true, "cmd_len": 5, "cmd_sample": "9602000000", "resp_len": 82, "resp_status": "0x0000", "note": "82-B progress record: coverage@+22, counter@+24, quality@+41"},
+     "linux": {"sends": true, "cmd_sample": "9602000000", "resp_status": "0x0404", "note": "never cleanly reached (create gated first)"},
+     "verdict": "DIVERGE — gated"},
+
+    {"op": "0x96", "sub": "0x03", "name": "ENROLL (finalize + user SID)",
+     "windows": {"sends": true, "cmd_len": 124, "cmd_sample": "9603000000000000006f0000000000100000004XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX01004c000000030000001c0000000105000000000005150000004XXXXXXXXXXXXXXXXXXXXXXXXXX0300000000...020001000000", "note": "embeds Windows user SID (S-1-5-21-...) + a GUID; SID/GUID REDACTED here"},
+     "linux": {"sends": false, "resp_status": null, "note": "downstream of the 0x96:01 gate — never reachable"},
+     "verdict": "GAP (downstream of gate; needed to complete enroll once authorized)"},
+
+    {"op": "0x96", "sub": "0x04", "name": "ENROLL (commit)",
+     "windows": {"sends": true, "cmd_len": 5, "cmd_sample": "9604000000", "resp_len": 2, "resp_status": "0x0000"},
+     "linux": {"sends": true, "cmd_sample": "9604000000", "resp_status": null, "note": "never reached"},
+     "verdict": "DIVERGE — gated (downstream)"},
+
+    {"op": "0x99", "sub": "0x01", "name": "IDENTIFY (dedup/verify)",
+     "windows": {"sends": true, "cmd_len": 13, "cmd_sample": "99010000000000000000000000", "resp_len": 2, "resp_status": ["0x0509", "0x0000"], "note": "0x0509 = no-match/proceed during enroll; 0x0000 = match during verify (177-B record)"},
+     "linux": {"sends": true, "cmd_sample": "99010000000000000000000000", "resp_status": "0x0405", "source": "p2_moc.py — BYTE-IDENTICAL input"},
+     "verdict": "DIVERGE — gated (host-not-authorized)"},
+
+    {"op": "0x9e", "sub": "0x01", "name": "DB2_GET_DB_INFO",
+     "windows": {"sends": true, "cmd_len": 2, "cmd_sample": "9e01", "resp_len": 40, "resp_status": "0x0000"},
+     "linux": {"sends": true, "resp_status": "0x0000", "note": "max_slots=100"},
+     "verdict": "MATCH"},
+
+    {"op": "0x9f", "name": "DB2_GET_OBJ_LIST",
+     "windows": {"sends": true, "cmd_len": 21, "cmd_sample": "9f030000001d1a351c1c54a484d33501bc972cc1c1", "subs": ["02","03"], "resp_len": 36, "resp_status": "0x0000"},
+     "linux": {"sends": true, "resp_status": "0x0000", "note": "status||count||GUID*n; shows the 3 Windows templates"},
+     "verdict": "MATCH"},
+
+    {"op": "0xa0", "sub": "0x02", "name": "DB2_GET_OBJ_INFO",
+     "windows": {"sends": true, "cmd_len": 21, "cmd_sample": "a002000000<GUID16>", "resp_len": 52, "resp_status": "0x0000"},
+     "linux": {"sends": true, "resp_status": "0x0000", "note": "delete path: lookup child GUID"},
+     "verdict": "MATCH"},
+
+    {"op": "0xa3", "sub": "0x01", "name": "DB2_DELETE_OBJ",
+     "windows": {"sends": true, "cmd_len": 21, "cmd_sample": "a3010000004XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "resp_len": 4, "resp_status": "0x0000"},
+     "linux": {"sends": true, "resp_status": "0x0000", "note": "delete path (reversible rollback of an enroll)"},
+     "verdict": "MATCH"},
+
+    {"op": "0x50", "name": "GET_CERTIFICATE_EX",
+     "windows": {"sends": false, "note": "never on the wire — returns a cert cached by the PAIR/TLS handshake"},
+     "linux": {"sends": true, "cmd_sample": "5000", "resp_status": "0x0401", "source": "diag/findings/30"},
+     "verdict": "DIVERGE — gated (host-not-authorized); Windows sidesteps by caching"},
+
+    {"op": "0x3e", "name": "STORAGE_INFO_GET",
+     "windows": {"sends": "not in these captures"},
+     "linux": {"sends": true, "resp_status": "0x0000", "note": "52-B; 3 partition descriptors, type-2 host partition cap 4096"},
+     "verdict": "Linux-only (works)"},
+
+    {"op": "0x3f/0x40/0x41", "name": "STORAGE_PART_FORMAT/READ/WRITE",
+     "windows": {"sends": "first-time provisioning only (not in steady-state captures)"},
+     "linux": {"sends": true, "resp_status": "0x0000", "source": "findings/37 — write accepted+verbatim, gate unaffected"},
+     "verdict": "Linux-only (works; content is not the gate)"}
+  ]
+}
