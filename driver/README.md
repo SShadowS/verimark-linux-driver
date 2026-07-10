@@ -29,6 +29,7 @@ surface confirmed in `re/synaTudor-rev/libfprint/` (see file-level citations in
 | `verimark-moc.h/.c` | Match-on-chip operations layer: command builders/parsers (pure, offline-tested) + the `FpiSsm` capture/enroll/verify/identify/list/delete/clear state machines. |
 | `60-verimark.rules` | udev rule granting seat/plugdev access to `047d:00f2`; install into `/usr/lib/udev/rules.d/` alongside libfprint's own generated rules. |
 | `PORTING-PLAN.md` | The phased (P0-P7) port plan this driver follows; cites the exact prototype function each phase mirrors. |
+| `setup-libfprint-build.sh` | One-shot Fedora setup: installs build deps, wires `driver/*.c/.h` into a real libfprint tree (default: the `re/synaTudor-rev` reference clone) by editing its `meson.build` (`default_drivers` + per-driver source list + `libcrypto` dep, following the exact pattern libfprint uses for `goodixmoc`), compiles it, installs the udev rule, and prints `fprintd` test steps. `--help` for flags; safe to re-run. |
 
 ## How it maps to the protocol
 
