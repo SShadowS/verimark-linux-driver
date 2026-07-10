@@ -1,0 +1,16 @@
+# udev rule — Kensington VeriMark Desktop (Synaptics "Tudor" MOC), USB 047d:00f2.
+#
+# Grants the logged-in seat (via systemd-logind's uaccess mechanism) direct access
+# to the raw USB device node, the same way upstream libfprint ships per-device
+# rules in its generated `60-libfprint-2.rules` (see driver/meson.build's udev
+# note) so fprintd/libfprint can talk to the sensor without running as root.
+#
+# Install alongside libfprint's own rules, e.g.:
+#   install -m 0644 60-verimark.rules /usr/lib/udev/rules.d/
+#   udevadm control --reload-rules && udevadm trigger
+#
+# Modern systemd-logind (uaccess) is authoritative; the legacy GROUP="plugdev"
+# line is kept for older/non-systemd setups where uaccess isn't wired up.
+
+SUBSYSTEM=="usb", ATTR{idVendor}=="047d", ATTR{idProduct}=="00f2", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="047d", ATTR{idProduct}=="00f2", MODE="0664", GROUP="plugdev"

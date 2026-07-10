@@ -31,3 +31,4 @@ prototype/images/
 __pycache__/
 *.pyc
 prototype/prints/
+driver/tests/build/
