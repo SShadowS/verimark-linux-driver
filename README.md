@@ -30,6 +30,32 @@ a failed match can never delete your enrollment, but `fprintd` also can't
 enumerate or garbage-collect prints on the device. Details in
 [Limitations](#limitations).
 
+## Prerequisites
+
+- **The hardware:** a Kensington VeriMark Desktop (`047d:00f2`). Confirm it's
+  plugged in with `lsusb -d 047d:00f2`.
+- **A Fedora / RHEL-family system.** `setup-libfprint-build.sh` installs its
+  dependencies with `dnf`. It was developed and verified on **Fedora 44**. On
+  Debian/Arch/etc. the build still works, but you must translate the package
+  list yourself (see below) and run the setup script with `--skip-deps`.
+- **`sudo` access** — both scripts need it (`dnf install`, and the `fprintd`
+  drop-in / udev-rule install).
+- **Network access** — the setup script clones upstream `libfprint`
+  (1.94.10) from `gitlab.freedesktop.org`. Already have a checkout? Pass
+  `--libfprint-src /path/to/libfprint` to skip the clone.
+- **Build dependencies.** On Fedora the setup script installs these for you;
+  they're the equivalents to find on other distros:
+
+  ```
+  meson ninja-build cmake gcc gcc-c++ pkgconf-pkg-config
+  glib2-devel libgusb-devel openssl-devel json-glib-devel pixman-devel
+  nss-devel gobject-introspection-devel systemd-devel cairo-devel
+  fprintd fprintd-pam git
+  ```
+
+- **SELinux** is handled for you — if it's Enforcing, the install step
+  relocates and relabels the library (see the [SELinux note](#selinux-note)).
+
 ## Install
 
 Two steps: build the driver into a real `libfprint`, then point the system
