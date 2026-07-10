@@ -168,17 +168,18 @@ do_install() {
   log "Found built library: $sofile"
 
   log "Verifying the verimark driver is linked in"
-  local has_verimark=0
+  # NB: capture nm output into a variable and match with a case glob rather than
+  # piping into `grep -q`. Under `set -o pipefail`, `nm <bigfile> | grep -q X`
+  # returns non-zero even on a MATCH — grep -q exits at the first hit, SIGPIPEs
+  # nm, and pipefail propagates nm's non-zero. (fpi_device_verimark is a LOCAL
+  # symbol, so plain `nm` is needed, not `nm -D`.)
+  local has_verimark=0 nmout=""
   if command -v nm >/dev/null 2>&1; then
-    if nm -D "$sofile" 2>/dev/null | grep -q fpi_device_verimark \
-       || nm "$sofile" 2>/dev/null | grep -q fpi_device_verimark; then
-      has_verimark=1
-    fi
+    nmout="$(nm "$sofile" 2>/dev/null || true)"
+    case "$nmout" in *fpi_device_verimark*) has_verimark=1 ;; esac
   fi
   if [ "$has_verimark" -eq 0 ] && command -v strings >/dev/null 2>&1; then
-    if strings "$sofile" | grep -q 047d; then
-      has_verimark=1
-    fi
+    case "$(strings "$sofile" 2>/dev/null || true)" in *047d*) has_verimark=1 ;; esac
   fi
   [ "$has_verimark" -eq 1 ] || die "$sofile does not appear to contain the verimark driver
      (no fpi_device_verimark symbol / no '047d' string found).
@@ -188,12 +189,7 @@ do_install() {
 
   # ---- Verimark-only heuristic warning -------------------------------------
   local has_synaptics=0
-  if command -v nm >/dev/null 2>&1; then
-    if nm -D "$sofile" 2>/dev/null | grep -q fpi_device_synaptics \
-       || nm "$sofile" 2>/dev/null | grep -q fpi_device_synaptics; then
-      has_synaptics=1
-    fi
-  fi
+  case "$nmout" in *fpi_device_synaptics*) has_synaptics=1 ;; esac
   if [ "$has_synaptics" -eq 0 ]; then
     warn "This build looks verimark-ONLY (no fpi_device_synaptics symbol)."
     warn "While this drop-in is active, fprintd will only see the VeriMark"
