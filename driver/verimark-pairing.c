@@ -7,6 +7,7 @@
  * derivation and its little-endian-scalar quirk against the shipping DLL).
  */
 #define FP_COMPONENT "verimark"
+#define OPENSSL_API_COMPAT 0x10100000L  /* legacy EC_KEY API; silence 3.0 deprecations */
 #include "verimark-pairing.h"
 #include <string.h>
 #include <errno.h>

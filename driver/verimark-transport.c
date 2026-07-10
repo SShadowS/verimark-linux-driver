@@ -131,8 +131,7 @@ on_read_chunk_done (FpiUsbTransfer *transfer, FpDevice *dev,
           ctx->rretries++;
           g_clear_error (&error);
           fpi_ssm_jump_to_state_delayed (ssm, VERIMARK_CMD_STATE_READ_CHUNK,
-                                         VERIMARK_CTRL_READ_RETRY_DELAY_MS,
-                                         ctx->cancellable);
+                                         VERIMARK_CTRL_READ_RETRY_DELAY_MS);
           return;
         }
 

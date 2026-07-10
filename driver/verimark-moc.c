@@ -647,8 +647,7 @@ on_cap_wait_frame_done (FpDevice *dev, guint16 status, const guint8 *resp, gsize
           return;
         }
       fpi_ssm_jump_to_state_delayed (ssm, CAP_WAIT_FRAME,
-                                     VERIMARK_CAPTURE_FRAME_POLL_DELAY_MS,
-                                     ctx->cancellable);
+                                     VERIMARK_CAPTURE_FRAME_POLL_DELAY_MS);
       return;
     }
   if (status != 0x0000)
@@ -688,7 +687,7 @@ on_cap_wait_frame_done (FpDevice *dev, guint16 status, const guint8 *resp, gsize
       return;
     }
   fpi_ssm_jump_to_state_delayed (ssm, CAP_WAIT_FRAME,
-                                 VERIMARK_CAPTURE_FRAME_POLL_DELAY_MS, ctx->cancellable);
+                                 VERIMARK_CAPTURE_FRAME_POLL_DELAY_MS);
 }
 
 static void

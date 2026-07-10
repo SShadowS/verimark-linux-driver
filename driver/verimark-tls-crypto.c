@@ -1,4 +1,6 @@
 /* verimark-tls-crypto.c — see verimark-tls-crypto.h. SPDX-License-Identifier: LGPL-2.1-or-later */
+/* Use the legacy EC_KEY/ECDSA API (matches the unit-test build); silence 3.0 deprecations. */
+#define OPENSSL_API_COMPAT 0x10100000L
 #include "verimark-tls-crypto.h"
 #include <string.h>
 #include <openssl/hmac.h>

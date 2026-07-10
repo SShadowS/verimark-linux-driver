@@ -21,6 +21,7 @@
  *    messages, 0x17 for steady-state application_data, 0x15 for alerts.
  */
 #define FP_COMPONENT "verimark"
+#define OPENSSL_API_COMPAT 0x10100000L  /* legacy EC_KEY API; silence 3.0 deprecations */
 #include "verimark-tls.h"
 #include <string.h>
 #include <openssl/evp.h>
