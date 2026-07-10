@@ -123,6 +123,14 @@ the older RE reference tree it was written by reading headers against.
 3. **Then exercise on-device** (the part still actually deferred — no VeriMark hardware on this
    machine): open/pair, enroll, verify/identify, list/delete/clear_storage. See the script's own
    printed "next steps" for the `fprintd` `LD_LIBRARY_PATH` drop-in test procedure.
+   **SELinux note (verified live):** on Fedora with SELinux Enforcing, `fprintd` runs confined as
+   `fprintd_t`, which is denied `dac_override`/`dac_read_search` on `/home` — it cannot dlopen a
+   `libfprint-2.so` that lives under a user's home directory (labeled `user_home_t`); `ld.so` just
+   silently falls back to the system libfprint, so only built-in/supported readers work with no
+   error. `driver/install-verimark.sh` now copies the built `.so` into
+   `/usr/local/lib64/verimark-libfprint` (relabeled `lib_t`) and points the systemd drop-in's
+   `LD_LIBRARY_PATH` there instead of at the build dir directly — required for the drop-in to
+   actually take effect under Enforcing.
 
 ## Deferred / open (state honestly)
 

@@ -6,14 +6,24 @@
 # Mechanism (fully reversible):
 #   1. Install driver/60-verimark.rules into /usr/lib/udev/rules.d/ so the
 #      logged-in seat gets uaccess to 047d:00f2.
-#   2. Drop a systemd unit override on fprintd.service that sets
-#      LD_LIBRARY_PATH to the build's libfprint/ dir, so the dynamic linker
-#      finds our libfprint-2.so.2 before the system one on the default
-#      search path. fprintd is D-Bus-activated, so stopping it is enough to
-#      make the next activation pick up the new environment.
+#   2. Copy the built libfprint-2.so.2.0.0 from the build dir into a SYSTEM
+#      path (/usr/local/lib64/verimark-libfprint) and relabel it lib_t. This
+#      step exists because of a VERIFIED SELinux issue: fprintd runs confined
+#      as fprintd_t, which is denied dac_override/dac_read_search on /home
+#      (and the build's .so is labeled user_home_t) — so under Enforcing,
+#      fprintd can NEVER dlopen a library that lives under a user's home
+#      directory. Pointing LD_LIBRARY_PATH straight at the build dir is
+#      silently ignored: ld.so falls back to the system libfprint with no
+#      error, and only built-in/supported readers work.
+#   3. Drop a systemd unit override on fprintd.service that sets
+#      LD_LIBRARY_PATH to the RELOCATED system copy (not the build dir), so
+#      the dynamic linker finds our libfprint-2.so.2 before the system one on
+#      the default search path. fprintd is D-Bus-activated, so stopping it is
+#      enough to make the next activation pick up the new environment.
 #
-# --uninstall removes both changes and restarts fprintd on the stock system
-# libfprint. Both directions are idempotent — safe to re-run.
+# --uninstall removes all changes (drop-in, udev rule, relocated .so copy)
+# and restarts fprintd on the stock system libfprint. Both directions are
+# idempotent — safe to re-run.
 #
 # What this script does NOT do:
 #   - It never runs `meson install` / `ninja install`.
@@ -35,6 +45,15 @@ DEFAULT_BUILD_DIR="/home/sshadows/verimark-build/libfprint/build"
 BUILD_DIR="${VERIMARK_BUILD_DIR:-$DEFAULT_BUILD_DIR}"
 DO_UNINSTALL=0
 
+# Under SELinux Enforcing, fprintd runs confined as fprintd_t and is denied
+# dac_override/dac_read_search on /home (and the build's .so is labeled
+# user_home_t anyway), so it can NEVER dlopen a library that lives under a
+# user's home directory — ld.so silently falls back to the system libfprint
+# and the drop-in's LD_LIBRARY_PATH is effectively ignored. VERIFIED FIX:
+# copy the built .so into a system lib path (relabeled lib_t) and point the
+# drop-in there instead of at the home-dir build.
+RELOC_DIR="/usr/local/lib64/verimark-libfprint"
+
 UDEV_RULE_SRC="$SCRIPT_DIR/60-verimark.rules"
 UDEV_RULE_DST="/usr/lib/udev/rules.d/60-verimark.rules"
 
@@ -54,13 +73,21 @@ systemd drop-in (LD_LIBRARY_PATH), plus install the VeriMark udev rule.
 Non-destructive: never touches /usr/lib*/libfprint-2.so*, never runs
 'meson install'.
 
+The built .so is copied into $RELOC_DIR (relabeled lib_t) because SELinux's
+fprintd_t domain cannot load a library out of /home — see the header comment
+for details. The drop-in's LD_LIBRARY_PATH points at that relocated copy,
+not at --build-dir directly.
+
 Options:
   --build-dir PATH   Path to the libfprint meson build directory whose
-                      libfprint/ subdir holds libfprint-2.so.2.
+                      libfprint/ subdir holds libfprint-2.so.2. Used only to
+                      LOCATE and validate the source library; the runtime
+                      LD_LIBRARY_PATH points at the relocated system copy.
                       Default: $DEFAULT_BUILD_DIR
                       (also settable via \$VERIMARK_BUILD_DIR)
-  --uninstall         Revert: remove the systemd drop-in and udev rule, and
-                      restart fprintd on the stock system libfprint.
+  --uninstall         Revert: remove the systemd drop-in, udev rule, and the
+                      relocated system copy of libfprint; restart fprintd on
+                      the stock system libfprint.
   --help              Show this help and exit.
 
 Examples:
@@ -129,6 +156,20 @@ do_uninstall() {
     log "udev rule already absent: $UDEV_RULE_DST"
   fi
 
+  if [ -d "$RELOC_DIR" ]; then
+    # Safety check: only rm -rf a path that is exactly the expected constant
+    # (never a variable that could have been mutated/expanded to something
+    # else) before removing it.
+    if [ "$RELOC_DIR" = "/usr/local/lib64/verimark-libfprint" ]; then
+      log "Removing relocated system libfprint copy: $RELOC_DIR"
+      sudo rm -rf -- "$RELOC_DIR"
+    else
+      warn "RELOC_DIR ('$RELOC_DIR') does not match the expected path — refusing to rm -rf it. Remove manually if needed."
+    fi
+  else
+    log "Relocated libfprint dir already absent: $RELOC_DIR"
+  fi
+
   log "Reloading systemd units"
   sudo systemctl daemon-reload
 
@@ -141,6 +182,7 @@ do_uninstall() {
   log "Done. fprintd will re-activate using the system libfprint-2.so.2"
   log "(the built-in Synaptics 06cb:0126 reader and any other supported"
   log "readers are back to normal; verimark support is removed)."
+  log "(the relocated copy at $RELOC_DIR is also gone)."
 }
 
 do_install() {
@@ -210,14 +252,40 @@ do_install() {
   sudo udevadm control --reload-rules
   sudo udevadm trigger --subsystem-match=usb || true
 
-  # ---- 2. systemd drop-in ---------------------------------------------------
+  # ---- 2. relocate the built .so out of /home -------------------------------
+  # SELinux (Enforcing): fprintd runs confined as fprintd_t, which is denied
+  # dac_override/dac_read_search on /home — it can't even traverse into a
+  # user's home directory, let alone dlopen a .so labeled user_home_t there.
+  # Pointing LD_LIBRARY_PATH at the home-dir build (as this script used to)
+  # is therefore silently ignored under Enforcing: ld.so falls back to the
+  # system libfprint and only built-in/supported readers work, with no error.
+  # Fix: copy the built library into a system path and relabel it lib_t so
+  # fprintd_t is permitted to mmap it.
+  local sofile_real
+  sofile_real="$(readlink -f -- "$sofile")"
+  [ -n "$sofile_real" ] && [ -e "$sofile_real" ] || die "Could not resolve real file for $sofile"
+
+  log "Relocating built library out of /home (SELinux fprintd_t can't reach /home):"
+  log "  $sofile_real -> $RELOC_DIR/libfprint-2.so.2.0.0"
+  sudo mkdir -p "$RELOC_DIR"
+  sudo install -m0755 "$sofile_real" "$RELOC_DIR/libfprint-2.so.2.0.0"
+  sudo ln -sf libfprint-2.so.2.0.0 "$RELOC_DIR/libfprint-2.so.2"
+
+  if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
+    log "SELinux is enabled — relabeling relocated .so as lib_t"
+    sudo chcon -t lib_t "$RELOC_DIR/libfprint-2.so.2.0.0"
+  else
+    log "SELinux not enabled — skipping lib_t relabel"
+  fi
+
+  # ---- 3. systemd drop-in ---------------------------------------------------
   log "Creating systemd drop-in dir: $DROPIN_DIR"
   sudo mkdir -p "$DROPIN_DIR"
 
   log "Writing systemd drop-in: $DROPIN_FILE"
   sudo tee "$DROPIN_FILE" >/dev/null <<EOF
 [Service]
-Environment=LD_LIBRARY_PATH=$LIBDIR
+Environment=LD_LIBRARY_PATH=$RELOC_DIR
 EOF
 
   log "Reloading systemd units"
@@ -236,7 +304,13 @@ EOF
 Verify the drop-in took effect:
     systemctl show fprintd -p Environment
   should print:
-    Environment=LD_LIBRARY_PATH=$LIBDIR
+    Environment=LD_LIBRARY_PATH=$RELOC_DIR
+
+  Note: if SELinux is Enforcing and this pointed at the home-dir build
+  ($LIBDIR) instead, fprintd_t would be denied access to /home and ld.so
+  would silently fall back to the system libfprint — no error, just the
+  built-in reader working and VeriMark not. That's why the drop-in targets
+  the relocated system copy above, not the build dir directly.
 
 Test on-device:
   1. Plug in the Kensington VeriMark Desktop (047d:00f2).
