@@ -249,7 +249,12 @@ hs_process_rt1 (VerimarkTls *t, const guint8 *resp, gsize resp_len, GError **err
         {
         case 0x02: /* ServerHello */
           if (mlen < 2 + 32 + 1 + 2 + 1) { set_error (error, "RT1: ServerHello too short"); g_byte_array_free (hsbuf, TRUE); return FALSE; }
-          if (body[0] != 0x03 || body[1] != 0x03) { set_error (error, "RT1: bad proto version"); g_byte_array_free (hsbuf, TRUE); return FALSE; }
+          /* Do NOT validate the ServerHello protocol version: this sensor
+           * returns a non-0x0303 value (observed 0x0383) and rev never checks
+           * it (TlsProtocolVersion.read in tls/data/record.py:20-22 just reads
+           * the two bytes; the version is never used in key derivation). The
+           * two version bytes are still fed to the transcript hash above via
+           * EVP_DigestUpdate over the whole message. */
           memcpy (t->server_random, body + 2, 32);
           {
             guint8 ses_len = body[34];
