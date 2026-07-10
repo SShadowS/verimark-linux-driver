@@ -17,10 +17,6 @@
 
 #define FP_COMPONENT "verimark"
 
-/* TEMP timing instrumentation — remove after tuning. VMK_TIME() (verimark.h)
- * g_warning()s elapsed-ms at each dev_open() phase boundary below, tagged
- * "VMK-TIME:" for `journalctl -u fprintd | grep VMK-TIME`. */
-
 #include <string.h>
 
 #include "drivers_api.h"
@@ -432,22 +428,13 @@ dev_open (FpDevice *dev)
     g_autofree gchar *sid = NULL;
     g_autofree VerimarkPairing *pd = g_new0 (VerimarkPairing, 1);
     GError *load_error = NULL;
-    /* TEMP timing instrumentation — remove after tuning */
-    gint64 t_open_start = g_get_monotonic_time ();
-    gint64 t0, t1;
 
-    t0 = g_get_monotonic_time ();
     if (!verimark_resolve_sid_sync (dev, cancellable, &sid, &error))
       {
-        t1 = g_get_monotonic_time ();
-        VMK_TIME ("sid-resolve FAILED after %lld ms", (long long) ((t1 - t0) / 1000));
         verimark_open_fail (dev, error);
         return;
       }
-    t1 = g_get_monotonic_time ();
-    VMK_TIME ("sid-resolve %lld ms", (long long) ((t1 - t0) / 1000));
 
-    t0 = g_get_monotonic_time ();
     if (!verimark_pairing_load_file (sid, pd, &load_error))
       {
         if (!g_error_matches (load_error, G_FILE_ERROR, G_FILE_ERROR_NOENT))
@@ -455,8 +442,6 @@ dev_open (FpDevice *dev)
             /* A real (non-"missing file") error — e.g. permission denied or a
              * corrupt/short pdata file — is not silently papered over with a
              * fresh pair; propagate it. */
-            t1 = g_get_monotonic_time ();
-            VMK_TIME ("pairing FAILED (load error) after %lld ms", (long long) ((t1 - t0) / 1000));
             verimark_open_fail (dev, load_error);
             return;
           }
@@ -469,35 +454,23 @@ dev_open (FpDevice *dev)
         if (!verimark_pairing_do (verimark_pair_io_sync, dev, pd, &error) ||
             !verimark_pairing_save_file (pd, sid, &error))
           {
-            t1 = g_get_monotonic_time ();
-            VMK_TIME ("pairing FAILED (0x93) after %lld ms", (long long) ((t1 - t0) / 1000));
             verimark_open_fail (dev, error);
             return;
           }
       }
-    t1 = g_get_monotonic_time ();
-    VMK_TIME ("pairing %lld ms", (long long) ((t1 - t0) / 1000));
 
     self->tls = verimark_tls_new (verimark_tls_io_sync, dev);
     verimark_tls_set_pairing (self->tls, pd);
-    t0 = g_get_monotonic_time ();
     if (!verimark_tls_handshake (self->tls, &error))
       {
-        t1 = g_get_monotonic_time ();
-        VMK_TIME ("handshake FAILED after %lld ms", (long long) ((t1 - t0) / 1000));
         verimark_open_fail (dev, error);
         return;
       }
-    t1 = g_get_monotonic_time ();
-    VMK_TIME ("handshake %lld ms", (long long) ((t1 - t0) / 1000));
 
     /* Everything succeeded — transfer ownership from the g_autofree locals
      * into the device struct (freed at dev_close()). */
     self->sid = g_steal_pointer (&sid);
     self->pairing = g_steal_pointer (&pd);
-
-    VMK_TIME ("dev_open total %lld ms",
-             (long long) ((g_get_monotonic_time () - t_open_start) / 1000));
   }
 
   fpi_device_open_complete (dev, NULL);
@@ -631,10 +604,19 @@ fpi_device_verimark_class_init (FpiDeviceVerimarkClass *klass)
   dev_class->id_table         = id_table;
   dev_class->scan_type        = FP_SCAN_TYPE_PRESS;
   dev_class->nr_enroll_stages = VERIMARK_ENROLL_STAGES;
+  /* NB: FP_DEVICE_FEATURE_STORAGE_LIST is deliberately NOT advertised. With it,
+   * fprintd's check_local_storage() (src/device.c) runs after any *no-match*
+   * verify and deletes every host print whose fpi-data isn't byte-equal to a
+   * device-listed print. Enroll stores the id in the minted_tid field while
+   * list returns it as list_gid (and the two GUIDs even differ, findings/51),
+   * so fp_print_equal never matches and a single no-match PURGES the just-
+   * enrolled template. Until enroll/list emit reconcilable fpi-data (needs the
+   * unverified 0xa0 minted<->list GUID bridge), withholding STORAGE_LIST keeps
+   * the no-match non-destructive. dev_list stays wired for explicit callers;
+   * STORAGE_DELETE/CLEAR remain for user-initiated deletes. */
   dev_class->features         = FP_DEVICE_FEATURE_IDENTIFY |
                                 FP_DEVICE_FEATURE_VERIFY |
                                 FP_DEVICE_FEATURE_STORAGE |
-                                FP_DEVICE_FEATURE_STORAGE_LIST |
                                 FP_DEVICE_FEATURE_STORAGE_DELETE |
                                 FP_DEVICE_FEATURE_STORAGE_CLEAR;
 

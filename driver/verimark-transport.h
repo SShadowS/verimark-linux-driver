@@ -116,40 +116,6 @@ void verimark_intr_wait_async (FpDevice             *dev,
                                gpointer              user_data);
 
 /**
- * VerimarkDrainCallback:
- * @dev: the device
- * @error: (transfer full) (nullable): %NULL on normal completion; non-%NULL
- *   only on a cancellation surfaced by the drain SSM (a per-read timeout is
- *   the normal, expected end and is NOT reported as an error)
- * @user_data: as passed to verimark_intr_drain_async()
- */
-typedef void (*VerimarkDrainCallback) (FpDevice *dev,
-                                       GError   *error,
-                                       gpointer  user_data);
-
-/**
- * verimark_intr_drain_async:
- * @dev: the device
- * @cancellable: (nullable): cancellable for the whole drain
- * @callback: called exactly once when the drain finishes
- * @user_data: passed through to @callback
- *
- * ASYNC analogue of verimark_intr_drain_sync(), safe to call from inside the
- * async capture #FpiSsm flow (a synchronous transfer there corrupts the
- * in-flight async EP0 reads — see verimark-transport.h / verimark-moc.c). Runs
- * its own internal #FpiSsm that repeatedly submits a single short-timeout
- * interrupt-IN read and DISCARDS whatever arrives, until a read times out
- * (nothing left queued) or a bounded read budget is spent. Used by the capture
- * SSM to consume the FINGER_PRESS state-echo the sensor emits immediately when
- * the finger event mask is (re-)armed, BEFORE arming the real press-wait, so
- * that only a genuinely fresh finger-down can satisfy verimark_intr_wait_async().
- */
-void verimark_intr_drain_async (FpDevice             *dev,
-                                GCancellable         *cancellable,
-                                VerimarkDrainCallback callback,
-                                gpointer              user_data);
-
-/**
  * verimark_intr_drain_sync:
  * @dev: the device
  *
@@ -162,10 +128,11 @@ void verimark_intr_drain_async (FpDevice             *dev,
  * event left over from a previous swipe/settle satisfies
  * verimark_intr_wait_async() instantly (got=TRUE, 0ms), which arms a full
  * capture-frame wait for a finger that isn't actually down anymore and burns
- * the whole frame timeout before retrying. Call this once at dev_open()
- * (after the interface claim, before any command relies on interrupt state)
- * and again immediately before arming each fresh press-wait in the capture
- * SSM, so only a genuinely fresh finger-down can trigger a capture.
+ * the whole frame timeout before retrying. Called once at dev_open() (after
+ * the interface claim, before any command relies on interrupt state) to clear
+ * cross-open residue; the capture SSM itself does NOT drain per-arm — a fresh
+ * no-finger arm queues nothing, and a finger-down-at-arm echo must be accepted
+ * (not drained) so unlock takes a single tap.
  *
  * Uses a synchronous #GUsbDevice interrupt transfer (short per-attempt
  * timeout) rather than the async #FpiSsm machinery above — this is meant to
