@@ -56,44 +56,93 @@ passes standalone, but not wired into this `meson.build` — see the inventory r
 state machines in `verimark-moc.c`, or any of `verimark.c` — none of those compile without a real
 libfprint checkout.
 
+## Build status (2026-07-10): COMPILES against libfprint 1.94.10
+
+Later the same day, the driver was actually built (no device attached — this is a compile/link-only
+checkpoint, hardware exercise is still deferred, see below). Target: a **fresh upstream clone** of
+`https://gitlab.freedesktop.org/libfprint/libfprint.git`, tag/HEAD **1.94.10** — not the bundled
+`re/synaTudor-rev/libfprint` RE reference clone (that tree is 1.90.7 and was RE study material, never
+intended as the real build target). Result: **compiles and links cleanly** —
+
+- **76 `verimark` symbols** present in the built `libfprint.so`.
+- The driver is **registered in `fpi-drivers.c`** (generated from the `drivers_info` dict — confirms
+  `fpi_device_verimark_get_type` resolves and the meson registration took effect end to end, not just
+  a partial compile).
+
+Build config that worked:
+
+```
+meson setup build -Ddrivers=verimark -Dgtk-examples=false -Ddoc=false -Dintrospection=false
+meson compile -C build
+```
+
+**Reconciliation needed to get there** (small — the port's own architecture/protocol logic needed zero
+changes, everything here is build-plumbing):
+
+1. **`fpi_ssm_jump_to_state_delayed()` is a 3-arg call** in this libfprint version (`verimark-transport.c`,
+   `verimark-moc.c`) — already correct in the committed driver source, no fix needed at build time.
+2. **`OPENSSL_API_COMPAT` defines** (`0x10100000L`, silencing OpenSSL 3.0 deprecation warnings for the
+   legacy EC_KEY API) — already present in `verimark-pairing.c`, `verimark-tls.c`,
+   `verimark-tls-crypto.c`. Both (1) and (2) are **already committed in `driver/*.c` itself** as of this
+   session — nothing left to patch for them, and `driver/setup-libfprint-build.sh` does not (and must
+   not) patch them.
+3. **Upstream's driver-registration format is a DICT, not the flat list `driver/setup-libfprint-build.sh`
+   originally assumed.** Upstream 1.94.10's top-level `meson.build` has a `drivers_info` dict
+   (`'goodixmoc': {},` etc. — a driver needing extra deps declares `{ 'helper': ['openssl'] }`, which
+   alone pulls in libcrypto) and `libfprint/meson.build` has a matching `driver_sources` dict of
+   `files()` calls, not the older `default_drivers = [...]` list / `if driver == 'x' drivers_sources +=
+   [...] endif` per-driver blocks the script's registration step was written against (that pattern was
+   accurate for the 1.90.7 RE reference tree, not for real upstream). `setup-libfprint-build.sh` now
+   **auto-detects which format the target tree uses** and applies the matching idempotent insertion —
+   see its updated header comment and Section 2c.
+4. **`tests/meson.build`'s `foreach driver_test: drivers_tests`** (a 1-var foreach over a dict) is
+   rejected by the meson version on this machine — needed a compat patch to the 2-var form
+   `foreach driver_test, _vmk_unused : drivers_tests`. This could **not** be worked around by disabling
+   the `tests/`/`examples/` subdirs instead: core `fpi-device.c` `#include`s a `tests/`-generated header
+   (`fpi-test-emulation.h`), so disabling them breaks the *core* libfprint build, not just the test
+   suite. `setup-libfprint-build.sh` now applies this patch automatically (idempotent — only touches the
+   exact incompatible line, only if present).
+
+None of this touched the driver's actual protocol/crypto logic (findings/49/51's choreography) — it was
+purely getting a hand-written driver's build plumbing to match a real, current upstream tree instead of
+the older RE reference tree it was written by reading headers against.
+
 ## How to build/test on-device (next session)
 
-1. **Offline suite only, no libfprint needed** (what was verified this session):
+1. **Offline suite only, no libfprint needed** (what was verified 2026-07-10 morning):
    `meson setup driver/tests/build driver/tests && meson test -C driver/tests/build`
    — requires only `glib-2.0` and `libcrypto >=3.0` dev packages, already satisfied here.
-2. **Full driver, needs a real libfprint checkout:**
-   - Clone/checkout `libfprint` (not the RE reference clone at `re/synaTudor-rev/libfprint`, which is
-     read-only RE material — a real buildable tree).
-   - Drop this repo's `driver/*.c`/`*.h` into `libfprint/libfprint/drivers/verimark/`.
-   - Add `'verimark'` to the `drivers` list in libfprint's own `meson.build`; wire in the per-driver
-     snippet already staged in `driver/meson.build` (source list + `libcrypto` dependency, modeled on
-     `egismoc-sdcp`'s pattern).
-   - Install `libgusb`, `libcrypto` (>=3.0), `json-glib` dev packages (libfprint's own deps) — not
-     installed on this machine.
-   - `meson setup build && ninja -C build` — this is the **first compiler pass** `verimark.c` and the
-     `FpiSsm` half of `verimark-moc.c` will ever see; expect to fix compile errors (API surface was
-     confirmed by reading headers, not by compiling against them).
-   - Install `60-verimark.rules` alongside libfprint's generated udev rules.
-   - Then exercise on-device: open/pair, enroll, verify/identify, list/delete/clear_storage.
+2. **Full driver build against real libfprint — now automated and verified** (see Build status above):
+   `driver/setup-libfprint-build.sh --libfprint-src /path/to/upstream/libfprint/libfprint` (or let it
+   clone the recommended upstream tree per its own `--help`/error-path guidance). This wires the driver
+   into the target tree (dict- or list-format meson registration, auto-detected), installs deps
+   (including `cmake`, needed by upstream's `meson setup` and previously missing from the script's dnf
+   list), applies the `tests/meson.build` compat patch, and runs `meson setup`/`meson compile` with the
+   verified flags above. Install `60-verimark.rules` alongside libfprint's generated udev rules (the
+   script does this too, `--skip-udev` to opt out).
+3. **Then exercise on-device** (the part still actually deferred — no VeriMark hardware on this
+   machine): open/pair, enroll, verify/identify, list/delete/clear_storage. See the script's own
+   printed "next steps" for the `fprintd` `LD_LIBRARY_PATH` drop-in test procedure.
 
 ## Deferred / open (state honestly)
 
-1. **On-device build+test** — needs a real libfprint checkout (`drivers/verimark/`) + `libgusb`/
-   `libcrypto`/`json-glib` dev packages; none installed here, so the libfprint-integrated `.c` files
-   (`verimark.c`, the `FpiSsm` half of `verimark-moc.c`, all of `verimark-transport.c`) are
-   **uncompiled**.
-2. **`FpDeviceClass.clear_storage` / `fpi_device_clear_storage_complete`** don't exist in the RE
-   reference clone's older `fpi-device.h` — must be verified against whatever libfprint version is
-   actually targeted for the real build.
-3. **Minted-vs-`0x9f`-list template-id mapping** (findings/51 §5, still open) — the driver stores both
+1. **On-device test** — the driver now **builds and links cleanly** against upstream libfprint 1.94.10
+   (see Build status above; no longer uncompiled). What remains deferred is purely **hardware exercise**
+   — open/pair, enroll, verify/identify, list/delete/clear_storage against the real sensor — since there
+   is no VeriMark attached to this machine this session.
+2. **Minted-vs-`0x9f`-list template-id mapping** (findings/51 §5, still open) — the driver stores both
    ids (`fpi-data`: finger, minted_tid, list_gid, user_id); resolving which one `0xa0` actually wants
    is on-device-only.
-4. **Driver-synthesized SID vs. the captured Windows SID** — whether `0x96 03`'s embedded SID field
+3. **Driver-synthesized SID vs. the captured Windows SID** — whether `0x96 03`'s embedded SID field
    can be a driver-synthesized value (vs. the captured Windows SID `WIN_FINALIZE[49:77]` used verbatim
    by the prototype) is **untested**; `verimark-moc.c` synthesizes one from the local uid per the plan,
    but this has never round-tripped against the real sensor.
-5. **`0xa5` DB2_FORMAT clear payload** is a best-effort guess (`[0xa5, 0x01]`, shaped like the other
+4. **`0xa5` DB2_FORMAT clear payload** is a best-effort guess (`[0xa5, 0x01]`, shaped like the other
    DB2_* commands) — never captured live in any prototype run or `rev` trace.
+
+(`FpDeviceClass.clear_storage` / `fpi_device_clear_storage_complete` — previously listed here as a risk
+against the older RE reference tree's `fpi-device.h` — is now **resolved**: both exist in upstream
+1.94.10 and `verimark.c`'s use of them compiled cleanly. See Build status above.)
 
 ## Artifacts
 

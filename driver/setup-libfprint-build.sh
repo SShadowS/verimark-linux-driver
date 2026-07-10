@@ -60,19 +60,73 @@
 #
 # KNOWN API GAP (found by symbol-diffing driver/*.c against this reference
 # tree's fp-device.h/fpi-device.h — see findings/52 point 2, confirmed exactly
-# here): this reference tree is libfprint 1.90.7, which predates
+# here): the bundled RE reference tree is libfprint 1.90.7, which predates
 # `FpDeviceClass.features` / the `FP_DEVICE_FEATURE_*` enum entirely (not just
 # renamed — grep finds zero hits) and has no `clear_storage` vfunc /
 # `fpi_device_clear_storage_complete()`. verimark.c:599-604 sets
 # `dev_class->features = FP_DEVICE_FEATURE_IDENTIFY | ... |
 # FP_DEVICE_FEATURE_STORAGE_CLEAR` and verimark.c:613 wires
 # `dev_class->clear_storage = dev_clear_storage` (dev_clear_storage defined at
-# verimark.c:539) — both WILL fail to compile against this exact reference
-# tree. Every other libfprint symbol verimark.c/.h/-transport.c/-moc.c use
+# verimark.c:539) — both WILL fail to compile against this exact 1.90.7 tree.
+# Every other libfprint symbol verimark.c/.h/-transport.c/-moc.c use
 # (fpi_device_*_complete, fpi_usb_transfer_*, fpi_ssm_*, FpIdEntry, ...) DOES
-# exist here — this is the only gap. See preflight_api_check() below, which
-# detects this at setup time and prints the exact manual-step fix, and
+# exist here — this is the only gap against 1.90.7. See preflight_api_check()
+# below, which detects this at setup time and prints a note (non-fatal), and
 # compile-failure guidance which repeats it if the build dies here.
+#
+# UPDATE 2026-07-10 — VERIFIED AGAINST REAL UPSTREAM (libfprint 1.94.10): this
+# gap does NOT exist upstream (features/clear_storage landed well before
+# 1.94.10) and the driver compiles + links cleanly there — 76 verimark symbols,
+# registered in fpi-drivers.c (see findings/52, "Build status" section). Two
+# things changed for that build that this script must account for:
+#
+#   1. driver-registration file FORMAT changed. Upstream 1.94.10 no longer
+#      uses the flat `default_drivers = [ 'goodixmoc', ... ]` list / per-driver
+#      `if driver == 'goodixmoc' drivers_sources += [...] endif` blocks
+#      described above (that was accurate for the 1.90.7 reference tree this
+#      script originally targeted). Upstream now uses:
+#        - top-level meson.build: a `drivers_info` DICT, e.g.
+#            drivers_info = {
+#                ...
+#                'goodixmoc': {},
+#                ...
+#            }
+#          A driver needing an extra dependency declares it declaratively via
+#          `'helper'`, e.g. `'verimark': { 'helper': ['openssl'] }` — this
+#          alone pulls in libcrypto; no manual crypto_dep plumbing needed.
+#        - libfprint/meson.build: a `driver_sources` DICT of files() calls,
+#          e.g.
+#            driver_sources = {
+#                ...
+#                'goodixmoc' : files(
+#                    'drivers/goodixmoc/goodix.c',
+#                    'drivers/goodixmoc/goodix_proto.c',
+#                ),
+#                ...
+#            }
+#      The registration step below (Section 2c) now DETECTS which format the
+#      target tree uses (dict vs. the older flat-list form) and applies the
+#      matching idempotent insertion for each — both are supported so this
+#      script still works against the old bundled RE reference tree too.
+#   2. tests/meson.build's `foreach driver_test: drivers_tests` (1-var foreach
+#      over a dict) is rejected by some meson versions — Section 2d below
+#      patches it to the 2-var form `foreach driver_test, _vmk_unused :
+#      drivers_tests` when needed (idempotent). This must NOT be worked around
+#      by disabling the tests/ or examples/ subdirs — core fpi-device.c
+#      #includes a tests/-generated header (fpi-test-emulation.h), so
+#      disabling them breaks the core build, not just tests.
+#   3. The API-compat fixes this comment used to warn about at compile time
+#      (fpi_ssm_jump_to_state_delayed's 3-arg signature, OPENSSL_API_COMPAT
+#      defines for OpenSSL 3.0 deprecations) are now COMMITTED IN driver/*.c
+#      ITSELF (see verimark-pairing.c, verimark-tls.c, verimark-tls-crypto.c,
+#      verimark-transport.c, verimark-moc.c). This script does not and must
+#      not patch those — they ship correct already.
+#
+# A random future upstream HEAD past 1.94.10 may change either meson format
+# again (upstream is not API/build-format-stable) — if both the dict-format
+# and list-format anchors below fail to match, the script exits with a
+# MANUAL STEP pointing at the exact file to reconcile by hand; that is
+# expected occasionally when following upstream HEAD rather than a pinned tag.
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -111,10 +165,16 @@ Options:
                           env VERIMARK_WORK_DIR).
   --libfprint-src PATH    Use this libfprint checkout instead of the bundled
                           RE reference tree (env VERIMARK_LIBFPRINT_SRC).
-                          Default: re/synaTudor-rev/libfprint/libfprint
-                          (libfprint 1.90.7 — what verimark.c was written
-                          against; see the header comment in this script for
-                          the one known API gap at this version).
+                          RECOMMENDED: a real upstream clone —
+                            git clone https://gitlab.freedesktop.org/libfprint/libfprint.git /path/to/libfprint
+                            driver/setup-libfprint-build.sh --libfprint-src /path/to/libfprint/libfprint
+                          verified 2026-07-10 to compile+link cleanly against
+                          upstream 1.94.10 (findings/52). Default when this
+                          flag is omitted: re/synaTudor-rev/libfprint/libfprint
+                          (the bundled libfprint 1.90.7 RE reference tree —
+                          fine for early compile-error iteration, but older
+                          and not what was build-verified; see the header
+                          comment for the one known API gap at that version).
   --drivers LIST          -Ddrivers= value (default: verimark). Pass
                           "default" to build every normal driver plus
                           verimark (safe to `meson install` over the system
@@ -187,11 +247,14 @@ if [ "$DO_DEPS" -eq 1 ]; then
   log "Installing build dependencies (sudo dnf install)"
   # Core list per the task brief, plus gcc-c++ (libfprint's project() declares
   # C++ as a language for examples/cpp-test.cpp — meson refuses to configure
-  # at all without a C++ compiler, even when building only one C driver) and
+  # at all without a C++ compiler, even when building only one C driver),
   # git (to fetch a real libfprint if --libfprint-src points at a URL-less
-  # missing path later).
+  # missing path later), and cmake (upstream 1.94.10's meson.build probes for
+  # it via find_program/cmake module for some subproject/dependency fallback
+  # paths during `meson setup` — absent on a fresh Fedora minimal install;
+  # confirmed needed by the verified build, was missing from this list before).
   sudo dnf install -y \
-    meson ninja-build gcc gcc-c++ pkgconf-pkg-config \
+    meson ninja-build cmake gcc gcc-c++ pkgconf-pkg-config \
     glib2-devel libgusb-devel openssl-devel json-glib-devel pixman-devel \
     nss-devel gobject-introspection-devel systemd-devel cairo-devel \
     fprintd fprintd-pam git \
@@ -205,13 +268,16 @@ if [ "$DO_COPY" -eq 1 ]; then
   if [ ! -d "$LIBFPRINT_SRC" ] || [ ! -f "$LIBFPRINT_SRC/meson.build" ]; then
     die "libfprint source tree not found or invalid: $LIBFPRINT_SRC
 MANUAL STEP: either
-  (a) fetch the RE reference clone this repo normally uses:
+  (a) RECOMMENDED — point at a real upstream libfprint checkout:
+      git clone https://gitlab.freedesktop.org/libfprint/libfprint.git /path/to/libfprint
+      driver/setup-libfprint-build.sh --libfprint-src /path/to/libfprint/libfprint
+      (verified 2026-07-10: the driver compiles + links cleanly against
+      upstream 1.94.10 this way — see findings/52's Build status section)
+  (b) or fetch the bundled RE reference clone instead (older, 1.90.7, fine for
+      early compile-error iteration but not what was build-verified):
       git clone https://github.com/Popax21/synaTudor.git '$REPO_ROOT/re/synaTudor'
       git -C '$REPO_ROOT/re/synaTudor' worktree add '$REPO_ROOT/re/synaTudor-rev' rev
-      (re/ is gitignored on purpose — proprietary/RE material, never committed)
-  (b) or point at a real upstream libfprint checkout instead:
-      git clone https://gitlab.freedesktop.org/libfprint/libfprint.git /path/to/libfprint
-      driver/setup-libfprint-build.sh --libfprint-src /path/to/libfprint/libfprint"
+      (re/ is gitignored on purpose — proprietary/RE material, never committed)"
   fi
 
   if [ "$RECOPY_TREE" -eq 1 ] || [ ! -f "$LEVEL2_MESON" ]; then
@@ -256,11 +322,35 @@ MANUAL STEP: either
   fi
 
   # ---- 2c. Register 'verimark' + its sources + its crypto dep -----------
+  # Auto-detects which meson.build format the target tree uses and applies
+  # the matching idempotent insertion:
+  #   - DICT format (upstream 1.94.10+, verified 2026-07-10 — findings/52):
+  #       drivers_info dict entry `'goodixmoc': {},` in $LEVEL2_MESON, and a
+  #       `'goodixmoc' : files(...),` block in $LEVEL3_MESON. The dict format's
+  #       `{ 'helper': ['openssl'] }` pulls in libcrypto on its own — no manual
+  #       crypto_dep plumbing needed for this format.
+  #   - LIST format (the bundled 1.90.7 RE reference tree): the older flat
+  #       `default_drivers = [ 'goodixmoc', ... ]` list plus a per-driver
+  #       `if driver == 'tudor' ... endif` block in the `foreach driver:
+  #       drivers` loop, and manually-wired crypto_dep (as before).
+  # If NEITHER anchor matches (a future upstream HEAD changed the format
+  # again), this exits with a MANUAL STEP naming the exact file to reconcile —
+  # see the header comment for both known formats.
   log "Wiring 'verimark' into $LEVEL2_MESON / $LEVEL3_MESON"
   python3 - "$LEVEL2_MESON" "$LEVEL3_MESON" <<'PYEOF'
 import re, sys
 
 level2_path, level3_path = sys.argv[1], sys.argv[2]
+
+VERIMARK_SOURCES = [
+    'drivers/verimark/verimark.c',
+    'drivers/verimark/verimark-transport.c',
+    'drivers/verimark/verimark-transport-framing.c',
+    'drivers/verimark/verimark-tls.c',
+    'drivers/verimark/verimark-tls-crypto.c',
+    'drivers/verimark/verimark-pairing.c',
+    'drivers/verimark/verimark-moc.c',
+]
 
 def read(p):
     with open(p, encoding="utf-8") as f:
@@ -270,117 +360,176 @@ def write(p, s):
     with open(p, "w", encoding="utf-8") as f:
         f.write(s)
 
-# ---- LEVEL2: default_drivers list ----
+# =====================================================================
+# LEVEL2 (top-level meson.build): register the 'verimark' driver itself
+# =====================================================================
 level2 = read(level2_path)
-if "'verimark'" not in level2:
-    marker = "    'goodixmoc',\n"
-    if marker not in level2:
-        sys.exit("MANUAL STEP: could not find \"'goodixmoc',\" in %s to anchor the "
-                  "default_drivers insertion — add \"    'verimark',\" to the "
-                  "default_drivers list by hand." % level2_path)
-    level2 = level2.replace(marker, marker + "    'verimark',\n", 1)
-    print("  + added 'verimark' to default_drivers (%s)" % level2_path)
-else:
-    print("  = 'verimark' already in default_drivers (%s)" % level2_path)
 
-# ---- LEVEL2: crypto_dep declaration + detection ----
-if "crypto_dep = dependency(" not in level2:
-    decl_marker = "imaging_dep = dependency('', required: false)\n"
-    if decl_marker not in level2:
-        sys.exit("MANUAL STEP: could not find the imaging_dep declaration in %s to anchor "
-                  "the crypto_dep declaration — add\n"
-                  "    crypto_dep = dependency('', required: false)\n"
-                  "near nss_dep/imaging_dep by hand." % level2_path)
-    level2 = level2.replace(decl_marker, decl_marker + "crypto_dep = dependency('', required: false)\n", 1)
-
-    detect_anchor = "    if not all_drivers.contains(driver)\n"
-    if detect_anchor not in level2:
-        sys.exit("MANUAL STEP: could not find the 'if not all_drivers.contains(driver)' line in "
-                  "%s to anchor the verimark crypto_dep detection — add an\n"
-                  "    if driver == 'verimark'\n"
-                  "        crypto_dep = dependency('libcrypto', version: '>=3.0.0', required: false)\n"
-                  "        if not crypto_dep.found()\n"
-                  "            error('OpenSSL (libcrypto >=3.0.0 / openssl-devel) is required for "
-                  "the verimark driver')\n"
-                  "        endif\n"
-                  "    endif\n"
-                  "block inside the `foreach driver: drivers` loop by hand." % level2_path)
-    verimark_block = (
-        "    if driver == 'verimark'\n"
-        "        crypto_dep = dependency('libcrypto', version: '>=3.0.0', required: false)\n"
-        "        if not crypto_dep.found()\n"
-        "            error('OpenSSL (libcrypto >=3.0.0 / openssl-devel) is required for the verimark driver')\n"
-        "        endif\n"
-        "    endif\n"
-    )
-    level2 = level2.replace(detect_anchor, verimark_block + detect_anchor, 1)
-    print("  + added crypto_dep (libcrypto) declaration + detection (%s)" % level2_path)
+if re.search(r"'verimark'\s*:\s*\{", level2):
+    level2_format = "dict"
+    print("  = 'verimark' already in drivers_info dict (%s)" % level2_path)
+elif "'verimark',\n" in level2:
+    level2_format = "list"
+    print("  = 'verimark' already in default_drivers list (%s)" % level2_path)
 else:
-    print("  = crypto_dep already wired (%s)" % level2_path)
+    dict_anchor = re.search(r"^([ \t]*)'goodixmoc'\s*:\s*\{\}\s*,[ \t]*\n", level2, re.M)
+    list_anchor = "    'goodixmoc',\n"
+    if dict_anchor:
+        indent = dict_anchor.group(1)
+        insertion = "%s'verimark': { 'helper': ['openssl'] },\n" % indent
+        level2 = level2[:dict_anchor.end()] + insertion + level2[dict_anchor.end():]
+        level2_format = "dict"
+        print("  + [dict format] added \"'verimark': { 'helper': ['openssl'] },\" to drivers_info (%s)" % level2_path)
+    elif list_anchor in level2:
+        level2 = level2.replace(list_anchor, list_anchor + "    'verimark',\n", 1)
+        level2_format = "list"
+        print("  + [list format] added 'verimark' to default_drivers (%s)" % level2_path)
+    else:
+        sys.exit(
+            "MANUAL STEP: could not find a known 'goodixmoc' anchor in %s — checked both the "
+            "upstream 1.94.10+ drivers_info dict format (\"    'goodixmoc': {},\") and the older "
+            "default_drivers list format (\"    'goodixmoc',\"). This likely means a future "
+            "upstream libfprint HEAD changed the format again. Open the file, find how "
+            "'goodixmoc' is registered, and add an equivalent 'verimark' entry by hand (use "
+            "{ 'helper': ['openssl'] } if it's still dict-shaped, to pull in libcrypto), then "
+            "update this script's anchors to match." % level2_path)
+
+# crypto_dep is only hand-wired for the OLD list format; the dict format's
+# { 'helper': ['openssl'] } inserted above already pulls in libcrypto for us
+# (verified against upstream 1.94.10 — see findings/52).
+if level2_format == "list":
+    if "crypto_dep = dependency(" not in level2:
+        decl_marker = "imaging_dep = dependency('', required: false)\n"
+        if decl_marker not in level2:
+            sys.exit("MANUAL STEP: could not find the imaging_dep declaration in %s to anchor "
+                      "the crypto_dep declaration — add\n"
+                      "    crypto_dep = dependency('', required: false)\n"
+                      "near nss_dep/imaging_dep by hand." % level2_path)
+        level2 = level2.replace(decl_marker, decl_marker + "crypto_dep = dependency('', required: false)\n", 1)
+
+        detect_anchor = "    if not all_drivers.contains(driver)\n"
+        if detect_anchor not in level2:
+            sys.exit("MANUAL STEP: could not find the 'if not all_drivers.contains(driver)' line in "
+                      "%s to anchor the verimark crypto_dep detection — add an\n"
+                      "    if driver == 'verimark'\n"
+                      "        crypto_dep = dependency('libcrypto', version: '>=3.0.0', required: false)\n"
+                      "        if not crypto_dep.found()\n"
+                      "            error('OpenSSL (libcrypto >=3.0.0 / openssl-devel) is required for "
+                      "the verimark driver')\n"
+                      "        endif\n"
+                      "    endif\n"
+                      "block inside the `foreach driver: drivers` loop by hand." % level2_path)
+        verimark_block = (
+            "    if driver == 'verimark'\n"
+            "        crypto_dep = dependency('libcrypto', version: '>=3.0.0', required: false)\n"
+            "        if not crypto_dep.found()\n"
+            "            error('OpenSSL (libcrypto >=3.0.0 / openssl-devel) is required for the verimark driver')\n"
+            "        endif\n"
+            "    endif\n"
+        )
+        level2 = level2.replace(detect_anchor, verimark_block + detect_anchor, 1)
+        print("  + added crypto_dep (libcrypto) declaration + detection (%s)" % level2_path)
+    else:
+        print("  = crypto_dep already wired (%s)" % level2_path)
+else:
+    print("  = dict format: crypto_dep handled by { 'helper': ['openssl'] }, no manual wiring needed (%s)" % level2_path)
 
 write(level2_path, level2)
 
-# ---- LEVEL3: drivers_sources gathering for 'verimark' ----
+# =====================================================================
+# LEVEL3 (libfprint/meson.build): register 'verimark's 7 source files
+# =====================================================================
 level3 = read(level3_path)
-if "if driver == 'verimark'" not in level3:
-    anchor = "    if driver == 'tudor'\n"
-    if anchor not in level3:
-        sys.exit("MANUAL STEP: could not find \"if driver == 'tudor'\" in %s to anchor the "
-                  "verimark drivers_sources block — add it by hand inside the "
-                  "`foreach driver: drivers` loop:\n"
-                  "    if driver == 'verimark'\n"
-                  "        drivers_sources += [\n"
-                  "            'drivers/verimark/verimark.c',\n"
-                  "            'drivers/verimark/verimark-transport-framing.c',\n"
-                  "            'drivers/verimark/verimark-transport.c',\n"
-                  "            'drivers/verimark/verimark-tls-crypto.c',\n"
-                  "            'drivers/verimark/verimark-tls.c',\n"
-                  "            'drivers/verimark/verimark-pairing.c',\n"
-                  "            'drivers/verimark/verimark-moc.c',\n"
-                  "        ]\n"
-                  "    endif" % level3_path)
-    verimark_sources = (
-        "    if driver == 'verimark'\n"
-        "        drivers_sources += [\n"
-        "            'drivers/verimark/verimark.c',\n"
-        "            'drivers/verimark/verimark-transport-framing.c',\n"
-        "            'drivers/verimark/verimark-transport.c',\n"
-        "            'drivers/verimark/verimark-tls-crypto.c',\n"
-        "            'drivers/verimark/verimark-tls.c',\n"
-        "            'drivers/verimark/verimark-pairing.c',\n"
-        "            'drivers/verimark/verimark-moc.c',\n"
-        "        ]\n"
-        "    endif\n"
-    )
-    level3 = level3.replace(anchor, verimark_sources + anchor, 1)
-    print("  + added drivers_sources block for 'verimark' (7 files, %s)" % level3_path)
-else:
-    print("  = drivers_sources block for 'verimark' already present (%s)" % level3_path)
 
-# ---- LEVEL3: add crypto_dep to the deps=[...] array ----
-if re.search(r"\bcrypto_dep,", level3) is None:
-    deps_anchor = "    nss_dep,\n"
-    if deps_anchor not in level3:
-        sys.exit("MANUAL STEP: could not find \"    nss_dep,\" in the deps=[...] array in %s — "
-                  "add \"    crypto_dep,\" to that list by hand." % level3_path)
-    level3 = level3.replace(deps_anchor, deps_anchor + "    crypto_dep,\n", 1)
-    print("  + added crypto_dep to deps=[...] (%s)" % level3_path)
+if re.search(r"'verimark'\s*:\s*files\(", level3):
+    level3_format = "dict"
+    print("  = 'verimark' already in driver_sources files() dict (%s)" % level3_path)
+elif "if driver == 'verimark'" in level3:
+    level3_format = "list"
+    print("  = drivers_sources block for 'verimark' already present (%s)" % level3_path)
 else:
-    print("  = crypto_dep already in deps=[...] (%s)" % level3_path)
+    dict_anchor = re.search(
+        r"^([ \t]*)'goodixmoc'\s*:\s*files\(.*?\n[ \t]*\),[ \t]*\n",
+        level3, re.M | re.S)
+    list_anchor = "    if driver == 'tudor'\n"
+    if dict_anchor:
+        indent = dict_anchor.group(1)
+        lines = "".join("%s    '%s',\n" % (indent, src) for src in VERIMARK_SOURCES)
+        block = "%s'verimark' : files(\n%s%s),\n" % (indent, lines, indent)
+        level3 = level3[:dict_anchor.end()] + block + level3[dict_anchor.end():]
+        level3_format = "dict"
+        print("  + [dict format] added \"'verimark' : files(...)\" block (7 sources, %s)" % level3_path)
+    elif list_anchor in level3:
+        verimark_sources = (
+            "    if driver == 'verimark'\n"
+            "        drivers_sources += [\n"
+            + "".join("            '%s',\n" % src for src in VERIMARK_SOURCES) +
+            "        ]\n"
+            "    endif\n"
+        )
+        level3 = level3.replace(list_anchor, verimark_sources + list_anchor, 1)
+        level3_format = "list"
+        print("  + [list format] added drivers_sources block for 'verimark' (7 files, %s)" % level3_path)
+    else:
+        sys.exit(
+            "MANUAL STEP: could not find a known anchor in %s — checked both the upstream "
+            "1.94.10+ driver_sources files() dict format (\"'goodixmoc' : files(...)\") and the "
+            "older per-driver \"if driver == 'tudor'\" foreach form. This likely means a future "
+            "upstream libfprint HEAD changed the format again. Open the file, find how "
+            "'goodixmoc' sources are listed, and add an equivalent 'verimark' entry (7 files "
+            "under drivers/verimark/) by hand, then update this script's anchors to match." % level3_path)
+
+# crypto_dep in the deps=[...] array is only needed for the OLD list format.
+if level3_format == "list":
+    if re.search(r"\bcrypto_dep,", level3) is None:
+        deps_anchor = "    nss_dep,\n"
+        if deps_anchor not in level3:
+            sys.exit("MANUAL STEP: could not find \"    nss_dep,\" in the deps=[...] array in %s — "
+                      "add \"    crypto_dep,\" to that list by hand." % level3_path)
+        level3 = level3.replace(deps_anchor, deps_anchor + "    crypto_dep,\n", 1)
+        print("  + added crypto_dep to deps=[...] (%s)" % level3_path)
+    else:
+        print("  = crypto_dep already in deps=[...] (%s)" % level3_path)
+else:
+    print("  = dict format: no manual deps=[...] wiring needed for verimark (helper handles it, %s)" % level3_path)
 
 write(level3_path, level3)
 PYEOF
+
+  # ---- 2d. tests/meson.build meson-version compat patch -----------------
+  # Some meson versions reject the 1-var foreach-over-dict form upstream uses:
+  #   foreach driver_test: drivers_tests
+  # Patch to the 2-var form (idempotent — only touches the exact old line).
+  # Do NOT disable the tests/ or examples/ subdirs instead: core fpi-device.c
+  # #includes a tests/-generated header (fpi-test-emulation.h), so disabling
+  # them breaks the core build, not just the test suite.
+  TESTS_MESON="$LIBFPRINT_WORK/tests/meson.build"
+  if [ -f "$TESTS_MESON" ]; then
+    if grep -qF 'foreach driver_test: drivers_tests' "$TESTS_MESON" \
+       && ! grep -qF 'foreach driver_test, _vmk_unused : drivers_tests' "$TESTS_MESON"; then
+      sed -i 's/foreach driver_test: drivers_tests/foreach driver_test, _vmk_unused : drivers_tests/' "$TESTS_MESON"
+      echo "  + [tests/meson.build compat] patched 1-var foreach -> 2-var form ($TESTS_MESON)"
+    elif grep -qF 'foreach driver_test, _vmk_unused : drivers_tests' "$TESTS_MESON"; then
+      echo "  = tests/meson.build foreach compat patch already applied ($TESTS_MESON)"
+    else
+      echo "  = tests/meson.build foreach form not the known-incompatible 1-var pattern, left as-is ($TESTS_MESON)"
+    fi
+  fi
 
 else
   log "Skipping work-tree / driver-source setup (--skip-copy)"
 fi
 
-# ---- 2d. Preflight API compatibility check ---------------------------------
-# See header comment: this reference tree (1.90.7) has no FpDeviceClass
-# `features` field / FP_DEVICE_FEATURE_* enum, and no `clear_storage` vfunc /
-# fpi_device_clear_storage_complete(). verimark.c uses both. Detect it here so
-# the user isn't surprised by the compile error, and knows the fix before
-# spending time on it.
+# ---- 2e. Preflight API compatibility check (informational, non-fatal) -----
+# See header comment: OLD pre-~1.92 trees (like the bundled 1.90.7 RE
+# reference tree) lack FpDeviceClass's `features` field / FP_DEVICE_FEATURE_*
+# enum, and the `clear_storage` vfunc / fpi_device_clear_storage_complete().
+# verimark.c uses both. This is a non-fatal heads-up, not a build gate — it
+# does NOT exit/die, it only prints guidance before the compiler would hit the
+# same thing. Against upstream 1.94.10 (the recommended --libfprint-src target,
+# verified 2026-07-10 — findings/52) this tree has both APIs and the check is
+# expected to report OK / print nothing of concern; it only fires for older
+# trees such as the bundled RE reference clone.
 preflight_api_check() {
   local fp_h="$LIBFPRINT_WORK/libfprint/fp-device.h"
   local fpi_h="$LIBFPRINT_WORK/libfprint/fpi-device.h"
@@ -400,19 +549,20 @@ preflight_api_check() {
   verimark.c:599-604 sets dev_class->features = FP_DEVICE_FEATURE_IDENTIFY | ... |
   FP_DEVICE_FEATURE_STORAGE_CLEAR, and verimark.c:613 wires
   dev_class->clear_storage = dev_clear_storage (defined at verimark.c:539).
-  Both WILL fail to compile against a libfprint this old (1.90.7-era).
-  MANUAL STEP — pick one:
-    (a) Build against a modern upstream libfprint instead (has both APIs,
-        added ~1.92+):
-          git clone https://gitlab.freedesktop.org/libfprint/libfprint.git /path/to/libfprint
-          driver/setup-libfprint-build.sh --libfprint-src /path/to/libfprint/libfprint --recopy
-    (b) Or patch the COPY (not driver/!) to drop clear_storage support so it
-        matches this older API:
-          $DRIVERS_DEST/verimark.c — remove the
-          "FP_DEVICE_FEATURE_STORAGE_CLEAR" bit from the features assignment
-          (line ~604) and the "dev_class->clear_storage = dev_clear_storage;"
-          line (~613); rename dev_class->features itself if this tree lacks
-          the field entirely (it does, per this check).
+  Both WILL fail to compile against a libfprint tree this old (pre-~1.92).
+  This is just a heads-up, not a hard stop — the build will proceed and you'll
+  hit this as an actual compile error if it applies. To sidestep it entirely:
+    RECOMMENDED — build against upstream instead (has both APIs; verified
+    working end-to-end at 1.94.10 on 2026-07-10, see findings/52):
+      git clone https://gitlab.freedesktop.org/libfprint/libfprint.git /path/to/libfprint
+      driver/setup-libfprint-build.sh --libfprint-src /path/to/libfprint/libfprint --recopy
+    Alternative — patch the COPY (not driver/!) to drop clear_storage support
+    so it matches this older API:
+      $DRIVERS_DEST/verimark.c — remove the
+      "FP_DEVICE_FEATURE_STORAGE_CLEAR" bit from the features assignment
+      (line ~604) and the "dev_class->clear_storage = dev_clear_storage;"
+      line (~613); rename dev_class->features itself if this tree lacks
+      the field entirely (it does, per this check).
 EOF
   else
     echo "  preflight API check: OK (features + clear_storage present in this tree)"
@@ -427,6 +577,7 @@ if [ "$DO_BUILD" -eq 1 ]; then
     "-Ddrivers=$DRIVERS_OPT"
     "-Ddoc=false"        # avoids requiring gtk-doc/gi-docgen, not installed by this script
     "-Dgtk-examples=false"
+    "-Dintrospection=false"  # avoids requiring gobject-introspection tooling for a driver-only build
     "${EXTRA_MESON_ARGS[@]}"
   )
 
