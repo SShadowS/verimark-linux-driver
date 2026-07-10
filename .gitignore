@@ -16,6 +16,8 @@ pairing-fields.json
 plain.bin
 # Local Python venv (cryptography/pyusb for the prototype).
 .venv/
+# Local Claude Code machine config (permission allowlist + local paths) — not for publish.
+.claude/
 # Full decrypted command transcripts (embed the Windows user SID) — local, never commit.
 reference/protocol/transcripts/
 # Raw byte dump extracted from the proprietary DLL (regenerable from Ghidra) — treat like re/.

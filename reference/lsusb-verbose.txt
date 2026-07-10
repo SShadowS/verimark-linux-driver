@@ -14,7 +14,7 @@ Device Descriptor:
   bcdDevice            0.00
   iManufacturer           0 
   iProduct                2 VeriMark DT Fingerprint Key
-  iSerial                 1 9da7007f6c92
+  iSerial                 1 XXXXXXXXXXXX
   bNumConfigurations      1
   Configuration Descriptor:
     bLength                 9
