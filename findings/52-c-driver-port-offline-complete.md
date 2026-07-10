@@ -1,12 +1,13 @@
-# findings/52 — C libfprint driver port: OFFLINE-COMPLETE (uncompiled against real libfprint, on-device deferred)
+# findings/52 — C libfprint driver port: OFFLINE-COMPLETE → BUILDS → ON-DEVICE ENROLL+VERIFY WORKING
 
-**Date:** 2026-07-10. Documentation/status checkpoint, no device, no new RE. Records that the
-clean-room C port of the VeriMark (`047d:00f2`) driver — begun in the 2026-07-07 skeleton, taken
-through the TLS core/channel and MOC plans, then integrated this session — now has **every layer of
-`driver/` written**, with the pure-logic parts offline-tested green. This does **not** claim the
-driver runs on hardware: it has never been compiled against a real `libfprint` checkout, and the
-on-device SSM/USB paths are unverified by construction (no libfprint headers, no compiler pass, on
-this machine).
+**Date:** 2026-07-10. Records that the clean-room C port of the VeriMark (`047d:00f2`) driver — begun
+in the 2026-07-07 skeleton, taken through the TLS core/channel and MOC plans, then integrated — now has
+**every layer of `driver/` written**, with the pure-logic parts offline-tested green, **compiles and
+links against real upstream libfprint 1.94.10**, and — as of later the same day — **enrolls and
+verifies a real finger on real hardware through `fprintd`**. See the "On-device: ENROLL+VERIFY WORKING"
+section below for that milestone; speed/UX tuning is still in progress at time of writing. The
+sections below (module inventory, offline test result, build status) are the earlier-session
+checkpoints, kept as-is for the record.
 
 Source of truth for the wire protocol/crypto this port mirrors: **findings/49** (the truncated-command
 breakthrough that unblocked MOC `0x96 01`) and **findings/51** (enroll+verify working end-to-end from
@@ -132,21 +133,76 @@ the older RE reference tree it was written by reading headers against.
    `LD_LIBRARY_PATH` there instead of at the build dir directly — required for the drop-in to
    actually take effect under Enforcing.
 
+## On-device: ENROLL+VERIFY WORKING (2026-07-10)
+
+Later the same day, past the compile/link checkpoint above, the driver was actually run against the
+real sensor. **Milestone: end-to-end on real hardware through `fprintd` — a finger ENROLLED (pairing
+`0x93` + the custom TLS handshake + the full MOC choreography) and then VERIFIED (matched)** via
+`fprintd-enroll` / `fprintd-verify`. This is the **first time this device has worked as a fingerprint
+reader on Linux**. Full narrative, recipes, and the live session state: `RESUME-DRIVER-SHIP.md`
+(repo root).
+
+Two fixes were required to get from "compiles" to "works on the device":
+
+- **TLS RT1 — non-standard ServerHello version.** The sensor's real `ServerHello` carries version
+  `0x0383`, not the standard TLS 1.2 `0x0303`; the C parser's `0x0303` version check rejected the
+  live handshake. Fixed by dropping that check in `verimark-tls.c`.
+- **SELinux `lib_t` relocation.** Under SELinux Enforcing, `fprintd` runs confined as `fprintd_t`,
+  which is denied `dac_override`/`dac_read_search` on `/home` — it can never `dlopen` a libfprint
+  built under a user's home directory (`user_home_t`); pointing `LD_LIBRARY_PATH` straight at the
+  build dir is silently ignored (`ld.so` falls back to the stock system libfprint, no error, only
+  built-in readers work). Fixed by relocating the built `libfprint-2.so` to
+  `/usr/local/lib64/verimark-libfprint` (relabeled `lib_t`) and pointing a systemd
+  `LD_LIBRARY_PATH` drop-in there instead of at the build dir.
+
+New tooling, both committed under `driver/`:
+
+- **`driver/setup-libfprint-build.sh`** — installs Fedora build deps, clones/targets an upstream
+  `libfprint` checkout, registers the `verimark` driver into upstream's dict-format
+  `drivers_info`/`driver_sources` meson (auto-detecting dict vs. list format), applies the small
+  meson compat patch upstream needs on this machine's meson version, and builds.
+- **`driver/install-verimark.sh`** — the reversible, SELinux-safe install: relocates the built `.so`
+  to `/usr/local/lib64/verimark-libfprint` + `chcon lib_t`, drops the `fprintd.service`
+  `LD_LIBRARY_PATH` override, and installs `60-verimark.rules`. `--uninstall` fully reverts to the
+  stock reader. Never touches `/usr/lib*/libfprint-2.so*` or runs `meson install`.
+
+**Speed/UX tuning is in progress, not final.** Enroll was slow and retry-heavy: the sensor echoes a
+genuine `FINGER_PRESS` packet ~0–3 ms after every arm of the `0x86` finger-event mask — a "phantom
+press" that armed a frame-wait for a finger that wasn't there and burned the frame timeout in a loop.
+Fixed with an **async** interrupt drain (`verimark_intr_drain_async`, `verimark-transport.c`) called
+before each press-wait, plus a **sync** drain in `dev_open`, plus cutting the frame timeout
+`5000→1500 ms`. This is deployed and verified swipe-free (press-wait now correctly pends instead of
+firing on the phantom), but **has not yet been confirmed with a real-finger enroll** — that
+confirmation is the next session's first step per `RESUME-DRIVER-SHIP.md`. **Temporary `VMK-TIME`
+timing instrumentation is still present in the driver source** (behind a `VMK_TIME()` macro) and needs
+to be stripped once tuning is confirmed done.
+
+**Key lesson recorded for the state-machine work:** a *synchronous* USB transfer issued inside the
+async `FpiSsm` flow corrupts in-flight async EP0 reads and truncates the next wrapped MOC response
+(`unwrap: truncated record body`) — the capture/MOC path must stay async-only; synchronous transfers
+are safe only in `dev_open`'s deliberately-synchronous handshake.
+
 ## Deferred / open (state honestly)
 
-1. **On-device test** — the driver now **builds and links cleanly** against upstream libfprint 1.94.10
-   (see Build status above; no longer uncompiled). What remains deferred is purely **hardware exercise**
-   — open/pair, enroll, verify/identify, list/delete/clear_storage against the real sensor — since there
-   is no VeriMark attached to this machine this session.
+On-device enroll+verify itself is **DONE** (see above) — it is no longer in this list. What remains
+open, per `RESUME-DRIVER-SHIP.md`:
+
+1. **Speed/UX tuning finalization** — confirm the phantom-press async-drain fix with a real-finger
+   enroll (not yet done), then strip the temporary `VMK-TIME` instrumentation.
 2. **Minted-vs-`0x9f`-list template-id mapping** (findings/51 §5, still open) — the driver stores both
-   ids (`fpi-data`: finger, minted_tid, list_gid, user_id); resolving which one `0xa0` actually wants
-   is on-device-only.
-3. **Driver-synthesized SID vs. the captured Windows SID** — whether `0x96 03`'s embedded SID field
-   can be a driver-synthesized value (vs. the captured Windows SID `WIN_FINALIZE[49:77]` used verbatim
-   by the prototype) is **untested**; `verimark-moc.c` synthesizes one from the local uid per the plan,
-   but this has never round-tripped against the real sensor.
-4. **`0xa5` DB2_FORMAT clear payload** is a best-effort guess (`[0xa5, 0x01]`, shaped like the other
-   DB2_* commands) — never captured live in any prototype run or `rev` trace.
+   ids (`fpi-data`: finger, minted_tid, list_gid, user_id); confirming which one `0xa0`
+   (`fprintd-list`/`-delete`) actually addresses is on-device-only.
+3. **Driver-synthesized SID robustness** — a driver-synthesized SID (vs. the captured Windows SID
+   `WIN_FINALIZE[49:77]` used verbatim by the prototype) worked for the first live enroll; whether
+   it's robust across repeated enroll/delete cycles is unconfirmed.
+4. **`0xa5` DB2_FORMAT clear payload** is still a best-effort guess (`[0xa5, 0x01]`, shaped like the
+   other DB2_* commands) — needs `fprintd-delete`/clear-storage verification on-device.
+5. **Handshake-failure reset** — no defensive close/reset of the TLS session on a failed handshake;
+   a failed handshake can leave the sensor mid-handshake, potentially alerting the next attempt until
+   it times out/resets on its own.
+6. **Shippable polish** — migrate the crypto core off the legacy OpenSSL `EC_KEY` API
+   (`OPENSSL_API_COMPAT 0x10100000L`) to modern EVP; a code-review pass; optionally prepare an
+   upstream libfprint MR.
 
 (`FpDeviceClass.clear_storage` / `fpi_device_clear_storage_complete` — previously listed here as a risk
 against the older RE reference tree's `fpi-device.h` — is now **resolved**: both exist in upstream

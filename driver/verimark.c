@@ -17,6 +17,10 @@
 
 #define FP_COMPONENT "verimark"
 
+/* TEMP timing instrumentation — remove after tuning. VMK_TIME() (verimark.h)
+ * g_warning()s elapsed-ms at each dev_open() phase boundary below, tagged
+ * "VMK-TIME:" for `journalctl -u fprintd | grep VMK-TIME`. */
+
 #include <string.h>
 
 #include "drivers_api.h"
@@ -27,6 +31,8 @@
                                           * is not called directly from this file --
                                           * verimark-moc.c is the sole caller, via
                                           * verimark_moc_send(). */
+#include "verimark-transport.h"          /* verimark_intr_drain_sync() --
+                                          * phantom-press flush at dev_open() */
 #include "verimark-tls.h"
 #include "verimark-pairing.h"
 #include "verimark-moc.h"
@@ -409,6 +415,12 @@ dev_open (FpDevice *dev)
   self->pairing_data = NULL;
   self->pairing_len = 0;
 
+  /* Phantom-press fix (verimark-transport.h): flush any interrupt-IN (0x83)
+   * events already queued from before this open (e.g. a leftover press from
+   * whatever last touched the sensor) so the first real capture's
+   * press-wait can't be satisfied by stale data. */
+  verimark_intr_drain_sync (dev);
+
   /* ---- P1/P2 bring-up: resolve sid -> load-or-pair -> TLS handshake ----
    * Mirrors prototype/p1_pair.py end-to-end: (1) construct/reset (here:
    * GET_VERSION far enough to read the sid — GET_START_INFO itself carries no
@@ -420,13 +432,22 @@ dev_open (FpDevice *dev)
     g_autofree gchar *sid = NULL;
     g_autofree VerimarkPairing *pd = g_new0 (VerimarkPairing, 1);
     GError *load_error = NULL;
+    /* TEMP timing instrumentation — remove after tuning */
+    gint64 t_open_start = g_get_monotonic_time ();
+    gint64 t0, t1;
 
+    t0 = g_get_monotonic_time ();
     if (!verimark_resolve_sid_sync (dev, cancellable, &sid, &error))
       {
+        t1 = g_get_monotonic_time ();
+        VMK_TIME ("sid-resolve FAILED after %lld ms", (long long) ((t1 - t0) / 1000));
         verimark_open_fail (dev, error);
         return;
       }
+    t1 = g_get_monotonic_time ();
+    VMK_TIME ("sid-resolve %lld ms", (long long) ((t1 - t0) / 1000));
 
+    t0 = g_get_monotonic_time ();
     if (!verimark_pairing_load_file (sid, pd, &load_error))
       {
         if (!g_error_matches (load_error, G_FILE_ERROR, G_FILE_ERROR_NOENT))
@@ -434,6 +455,8 @@ dev_open (FpDevice *dev)
             /* A real (non-"missing file") error — e.g. permission denied or a
              * corrupt/short pdata file — is not silently papered over with a
              * fresh pair; propagate it. */
+            t1 = g_get_monotonic_time ();
+            VMK_TIME ("pairing FAILED (load error) after %lld ms", (long long) ((t1 - t0) / 1000));
             verimark_open_fail (dev, load_error);
             return;
           }
@@ -446,23 +469,35 @@ dev_open (FpDevice *dev)
         if (!verimark_pairing_do (verimark_pair_io_sync, dev, pd, &error) ||
             !verimark_pairing_save_file (pd, sid, &error))
           {
+            t1 = g_get_monotonic_time ();
+            VMK_TIME ("pairing FAILED (0x93) after %lld ms", (long long) ((t1 - t0) / 1000));
             verimark_open_fail (dev, error);
             return;
           }
       }
+    t1 = g_get_monotonic_time ();
+    VMK_TIME ("pairing %lld ms", (long long) ((t1 - t0) / 1000));
 
     self->tls = verimark_tls_new (verimark_tls_io_sync, dev);
     verimark_tls_set_pairing (self->tls, pd);
+    t0 = g_get_monotonic_time ();
     if (!verimark_tls_handshake (self->tls, &error))
       {
+        t1 = g_get_monotonic_time ();
+        VMK_TIME ("handshake FAILED after %lld ms", (long long) ((t1 - t0) / 1000));
         verimark_open_fail (dev, error);
         return;
       }
+    t1 = g_get_monotonic_time ();
+    VMK_TIME ("handshake %lld ms", (long long) ((t1 - t0) / 1000));
 
     /* Everything succeeded — transfer ownership from the g_autofree locals
      * into the device struct (freed at dev_close()). */
     self->sid = g_steal_pointer (&sid);
     self->pairing = g_steal_pointer (&pd);
+
+    VMK_TIME ("dev_open total %lld ms",
+             (long long) ((g_get_monotonic_time () - t_open_start) / 1000));
   }
 
   fpi_device_open_complete (dev, NULL);

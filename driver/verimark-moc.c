@@ -6,6 +6,11 @@
  * needs libfprint (fpi-device.h/fpi-ssm.h) and is device-tested (deferred —
  * see verimark-moc.h and the plan's [DEFERRED: device] markers below).
  *
+ * TEMP timing instrumentation — remove after tuning. VMK_TIME() (verimark.h)
+ * g_warning()s elapsed-ms at the capture-SSM press/frame waits and the
+ * enroll add-sample/whole-enroll boundaries below, tagged "VMK-TIME:" for
+ * `journalctl -u fprintd | grep VMK-TIME`.
+ *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
 
@@ -364,7 +369,11 @@ verimark_moc_parse_obj_info (const guint8  *resp,
  * just how patient the SSMs are before giving up.
  * ------------------------------------------------------------------------- */
 #define VERIMARK_CAPTURE_PRESS_TIMEOUT_MS   30000
-#define VERIMARK_CAPTURE_FRAME_TIMEOUT_MS    5000
+/* Cut from 5000 -> 1500 (see changelog): a real finger produces the 0x18
+ * frame-ready event in well under 1s; 1.5s is ample margin. Combined with
+ * the phantom-press drain above, this bounds the cost of any residual false
+ * press to 1.5s instead of the full 5s dead wait. */
+#define VERIMARK_CAPTURE_FRAME_TIMEOUT_MS    1500
 #define VERIMARK_CAPTURE_FRAME_POLL_DELAY_MS   15
 #define VERIMARK_ENROLL_OVERALL_TIMEOUT_MS 150000
 #define VERIMARK_VERIFY_MAX_ATTEMPTS             8
@@ -547,6 +556,11 @@ typedef struct
   gint64        frame_deadline_us;   /* set once CAP_FRAME_ACQ has fired */
   gboolean      frame_got;
   GCancellable *cancellable;         /* borrowed from fpi_device_get_cancellable() */
+
+  /* TEMP timing instrumentation — remove after tuning */
+  gint64        press_wait_start_us; /* set on entry to CAP_WAIT_PRESS       */
+  gint64        frame_wait_start_us; /* set once CAP_FRAME_ACQ has fired, same
+                                       * moment as frame_deadline_us above    */
 } VerimarkCaptureCtx;
 
 static void
@@ -571,16 +585,45 @@ on_cap_event_config_done (FpDevice *dev, guint16 status, const guint8 *resp, gsi
   fpi_ssm_next_state (ssm);
 }
 
+static void on_cap_wait_press_done (FpDevice *dev, gboolean got, guint8 seq,
+                                    GError *error, gpointer user_data);
+
+/* Arm-echo drain finished (verimark_intr_drain_async, CAP_WAIT_PRESS) — the
+ * phantom FINGER_PRESS the sensor emits on arm has been consumed, so now arm
+ * the real press-wait: only a genuinely fresh finger-down can satisfy it. */
+static void
+on_cap_drain_press_done (FpDevice *dev, GError *error, gpointer user_data)
+{
+  FpiSsm *ssm = user_data;
+  VerimarkCaptureCtx *ctx = fpi_ssm_get_data (ssm);
+
+  if (error != NULL)
+    {
+      fpi_ssm_mark_failed (ssm, error);
+      return;
+    }
+
+  /* TEMP timing instrumentation — remove after tuning */
+  ctx->press_wait_start_us = g_get_monotonic_time ();
+  verimark_intr_wait_async (dev, VERIMARK_EVT_FINGER_PRESS,
+                            VERIMARK_CAPTURE_PRESS_TIMEOUT_MS,
+                            ctx->cancellable, on_cap_wait_press_done, ssm);
+}
+
 static void
 on_cap_wait_press_done (FpDevice *dev, gboolean got, guint8 seq, GError *error, gpointer user_data)
 {
   FpiSsm *ssm = user_data;
+  VerimarkCaptureCtx *ctx = fpi_ssm_get_data (ssm);
+  /* TEMP timing instrumentation — remove after tuning */
+  gint64 ms = (g_get_monotonic_time () - ctx->press_wait_start_us) / 1000;
 
   (void) dev;
   (void) seq;
 
   if (error != NULL)
     {
+      VMK_TIME ("press-wait ERROR (%lld ms): %s", (long long) ms, error->message);
       fpi_ssm_mark_failed (ssm, error);
       return;
     }
@@ -590,10 +633,12 @@ on_cap_wait_press_done (FpDevice *dev, gboolean got, guint8 seq, GError *error, 
        * no press before the deadline; report as a retry-able condition
        * rather than a hard protocol error (mirrors goodixmoc's
        * FP_DEVICE_RETRY_GENERAL capture-failure idiom). */
+      VMK_TIME ("press-wait TIMEOUT (%lld ms)", (long long) ms);
       fpi_ssm_mark_failed (ssm, fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL,
                                                           "no finger detected"));
       return;
     }
+  VMK_TIME ("press-wait SUCCESS (%lld ms)", (long long) ms);
   fpi_ssm_next_state (ssm);
 }
 
@@ -617,6 +662,8 @@ on_cap_frame_acq_done (FpDevice *dev, guint16 status, const guint8 *resp, gsize 
 
   ctx->frame_deadline_us = g_get_monotonic_time ()
     + (gint64) VERIMARK_CAPTURE_FRAME_TIMEOUT_MS * 1000;
+  /* TEMP timing instrumentation — remove after tuning */
+  ctx->frame_wait_start_us = g_get_monotonic_time ();
   fpi_ssm_next_state (ssm);
 }
 
@@ -642,6 +689,9 @@ on_cap_wait_frame_done (FpDevice *dev, guint16 status, const guint8 *resp, gsize
       /* evt_read l.278-279 — "no events yet", retry (bounded). */
       if (past_deadline)
         {
+          /* TEMP timing instrumentation — remove after tuning */
+          VMK_TIME ("frame-wait TIMEOUT (not-ready) (%lld ms)",
+                   (long long) ((g_get_monotonic_time () - ctx->frame_wait_start_us) / 1000));
           ctx->frame_got = FALSE;
           fpi_ssm_next_state (ssm);
           return;
@@ -652,6 +702,9 @@ on_cap_wait_frame_done (FpDevice *dev, guint16 status, const guint8 *resp, gsize
     }
   if (status != 0x0000)
     {
+      /* TEMP timing instrumentation — remove after tuning */
+      VMK_TIME ("frame-wait ERROR status=0x%04x (%lld ms)", status,
+               (long long) ((g_get_monotonic_time () - ctx->frame_wait_start_us) / 1000));
       fpi_ssm_mark_failed (ssm,
                            fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
                                                      "EVENT_READ status 0x%04x", status));
@@ -674,6 +727,9 @@ on_cap_wait_frame_done (FpDevice *dev, guint16 status, const guint8 *resp, gsize
 
       if (saw_frame_ready)
         {
+          /* TEMP timing instrumentation — remove after tuning */
+          VMK_TIME ("frame-wait SUCCESS (%lld ms)",
+                   (long long) ((g_get_monotonic_time () - ctx->frame_wait_start_us) / 1000));
           ctx->frame_got = TRUE;
           fpi_ssm_next_state (ssm);
           return;
@@ -682,6 +738,9 @@ on_cap_wait_frame_done (FpDevice *dev, guint16 status, const guint8 *resp, gsize
 
   if (past_deadline)
     {
+      /* TEMP timing instrumentation — remove after tuning */
+      VMK_TIME ("frame-wait TIMEOUT (no 0x18 event) (%lld ms)",
+               (long long) ((g_get_monotonic_time () - ctx->frame_wait_start_us) / 1000));
       ctx->frame_got = FALSE;
       fpi_ssm_next_state (ssm);
       return;
@@ -733,9 +792,21 @@ capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
       }
 
     case CAP_WAIT_PRESS:
-      verimark_intr_wait_async (dev, VERIMARK_EVT_FINGER_PRESS,
-                                VERIMARK_CAPTURE_PRESS_TIMEOUT_MS,
-                                ctx->cancellable, on_cap_wait_press_done, ssm);
+      /* Arming the finger event mask (0x86 EVENT_CONFIG in CAP_ARM_PRESS) makes
+       * the sensor emit an immediate FINGER_PRESS (0x01) *state echo* on the
+       * interrupt-IN endpoint even with NO finger present (verified on-device:
+       * byte0==0x01, byte6 an incrementing seq, ~0-3ms after the arm, one per
+       * arm). Left unread it satisfies verimark_intr_wait_async() instantly
+       * (the "phantom press": a 0ms success that then burns a full frame-wait
+       * on a finger that isn't down). So drain the arm echo FIRST (async), then
+       * arm the real press-wait in on_cap_drain_press_done() — only a genuinely
+       * fresh finger-down can satisfy it then. The drain MUST be async: a
+       * synchronous USB transfer inside this async FpiSsm flow corrupts the
+       * in-flight async EP0 reads and truncates the next wrapped MOC response
+       * ("unwrap: truncated record body"). The one-time synchronous drain in
+       * dev_open() (verimark.c) cannot help — the echo is (re)generated by
+       * every arm, which happens long after that. */
+      verimark_intr_drain_async (dev, ctx->cancellable, on_cap_drain_press_done, ssm);
       break;
 
     case CAP_ARM_FRAME:
@@ -913,6 +984,11 @@ typedef struct
 {
   gint64        overall_deadline_us;   /* p2_moc.py:172 overall_deadline = now+150 */
   GCancellable *cancellable;
+
+  /* TEMP timing instrumentation — remove after tuning */
+  gint64        wall_start_us;         /* set in verimark_moc_enroll() */
+  gint64        sample_start_us;       /* set on entry to ENR_SAMPLE   */
+  guint         sample_num;            /* add-sample attempt counter, 1-based */
 } VerimarkEnrollCtx;
 
 /* Bypasses fpi_ssm_start_subsm() on purpose: a capture failure during the
@@ -998,17 +1074,45 @@ on_enr_sample_done (FpDevice *dev, guint16 status, const guint8 *resp, gsize res
   VerimarkEnrollCtx *ectx = fpi_ssm_get_data (ssm);
   VerimarkMocSample sample;
   GError *perr = NULL;
+  /* TEMP timing instrumentation — remove after tuning */
+  gint64 rt_ms = (g_get_monotonic_time () - ectx->sample_start_us) / 1000;
+  gboolean parsed;
+
+  ectx->sample_num++;
 
   if (error != NULL)
     {
+      VMK_TIME ("sample #%u status=ERROR (rt %lld ms): %s",
+               ectx->sample_num, (long long) rt_ms, error->message);
       fpi_ssm_mark_failed (ssm, error);
       return;
+    }
+
+  /* Parse unconditionally (pure/idempotent) so we can log the outcome even
+   * when status != 0 — the `if` below still short-circuits on status first,
+   * exactly as before, just via `!parsed` instead of a second identical
+   * call. */
+  parsed = verimark_moc_parse_sample (resp, resp_len, &sample, &perr);
+  if (parsed)
+    {
+      gboolean accepted = status == 0x0000 && sample.coverage != self->enroll_coverage;
+
+      VMK_TIME ("sample #%u status=0x%04x cov=0x%02x qual=%d %s (rt %lld ms)",
+               ectx->sample_num, status, sample.coverage, sample.quality,
+               accepted ? "ACCEPTED" : "RETRY", (long long) rt_ms);
+    }
+  else
+    {
+      VMK_TIME ("sample #%u status=0x%04x <unparsable%s%s> (rt %lld ms)",
+               ectx->sample_num, status,
+               perr != NULL ? ": " : "", perr != NULL ? perr->message : "",
+               (long long) rt_ms);
     }
 
   /* p2_moc.py:198-208 — a rejected sample (nonzero status) or one that
    * didn't move coverage forward is NOT a hard failure: reposition and
    * capture again, bounded by the overall enroll deadline. */
-  if (status != 0x0000 || !verimark_moc_parse_sample (resp, resp_len, &sample, &perr) ||
+  if (status != 0x0000 || !parsed ||
       sample.coverage == self->enroll_coverage)
     {
       g_clear_error (&perr);
@@ -1131,6 +1235,8 @@ enroll_ssm_handler (FpiSsm *ssm, FpDevice *dev)
         guint8 cmd[5];
         gsize len = verimark_moc_build_enroll_sample (cmd);
 
+        /* TEMP timing instrumentation — remove after tuning */
+        ectx->sample_start_us = g_get_monotonic_time ();
         verimark_moc_send (dev, cmd, len, 82, ectx->cancellable, on_enr_sample_done, ssm);
         break;
       }
@@ -1170,15 +1276,22 @@ verimark_enroll_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK (dev);
   FpPrint *print = NULL;
+  /* TEMP timing instrumentation — remove after tuning. ectx is still valid
+   * here — freed by the ssm_data destroy notify right after this callback
+   * returns (same lifetime rule as verimark_cmd_ctx_free(), transport.c). */
+  VerimarkEnrollCtx *ectx = fpi_ssm_get_data (ssm);
+  gint64 wall_ms = (g_get_monotonic_time () - ectx->wall_start_us) / 1000;
 
-  (void) ssm;
   self->task_ssm = NULL;
 
   if (error != NULL)
     {
+      VMK_TIME ("enroll TOTAL FAILED %lld ms (%u samples): %s",
+               (long long) wall_ms, ectx->sample_num, error->message);
       fpi_device_enroll_complete (dev, NULL, error);
       return;
     }
+  VMK_TIME ("enroll TOTAL %lld ms (%u samples)", (long long) wall_ms, ectx->sample_num);
 
   fpi_device_get_enroll_data (dev, &print);
 
@@ -1214,6 +1327,9 @@ verimark_moc_enroll (FpDevice *dev)
   ectx->overall_deadline_us = g_get_monotonic_time ()
     + (gint64) VERIMARK_ENROLL_OVERALL_TIMEOUT_MS * 1000;
   ectx->cancellable = fpi_device_get_cancellable (dev);
+  /* TEMP timing instrumentation — remove after tuning */
+  ectx->wall_start_us = g_get_monotonic_time ();
+  ectx->sample_num = 0;
 
   ssm = fpi_ssm_new (dev, enroll_ssm_handler, ENR_N_STATES);
   fpi_ssm_set_data (ssm, ectx, g_free);

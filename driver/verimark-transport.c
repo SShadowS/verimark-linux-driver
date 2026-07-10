@@ -464,3 +464,197 @@ verimark_intr_wait_async (FpDevice             *dev,
   fpi_ssm_set_data (ssm, ctx, (GDestroyNotify) verimark_intr_ctx_free);
   fpi_ssm_start (ssm, intr_ssm_completed);
 }
+
+/* =============================================================================
+ * verimark_intr_drain_async — ASYNC arm-echo drain (see verimark-transport.h).
+ *
+ * Arming the finger event mask (0x86 EVENT_CONFIG) makes the sensor emit an
+ * immediate FINGER_PRESS (0x01) *state echo* on the interrupt-IN endpoint even
+ * with no finger present (verified on-device: byte0==0x01, byte6 an
+ * incrementing seq, arriving 0-3ms after the arm, one per arm). Left unread it
+ * satisfies verimark_intr_wait_async() instantly, so the capture SSM must
+ * consume the echo(es) BEFORE arming the real press-wait — but from inside the
+ * async capture flow, where a synchronous transfer would corrupt the in-flight
+ * async EP0 reads (verimark-transport.h). This is the async analogue of
+ * verimark_intr_drain_sync(): its own FpiSsm submitting short-timeout
+ * interrupt-IN reads, discarding whatever arrives, until a read times out
+ * (nothing left queued) or a bounded read budget is spent.
+ * ============================================================================= */
+
+/* Per-read timeout — generous enough that the arm echo (arrives within a few
+ * ms of the arm) is reliably caught by the first read, so a single timeout
+ * cleanly signals "nothing more queued". */
+#define VERIMARK_INTR_DRAIN_ASYNC_TIMEOUT_MS 60
+/* Bounded so a genuine event flood (or a held finger continuously re-emitting)
+ * can never make the drain spin forever. */
+#define VERIMARK_INTR_DRAIN_ASYNC_MAX_READS  16
+
+enum
+{
+  VERIMARK_DRAIN_STATE_READ,
+  VERIMARK_DRAIN_N_STATES,
+};
+
+typedef struct
+{
+  guint8                 ep;
+  guint                  reads_left;
+
+  GCancellable          *cancellable;   /* owned (extra ref), nullable */
+  VerimarkDrainCallback  callback;
+  gpointer               user_data;
+} VerimarkDrainCtx;
+
+static void
+verimark_drain_ctx_free (VerimarkDrainCtx *ctx)
+{
+  g_clear_object (&ctx->cancellable);
+  g_free (ctx);
+}
+
+static void
+on_intr_drain_read_done (FpiUsbTransfer *transfer, FpDevice *dev,
+                         gpointer user_data, GError *error)
+{
+  FpiSsm *ssm = user_data;
+  VerimarkDrainCtx *ctx = fpi_ssm_get_data (ssm);
+
+  (void) transfer;
+  (void) dev;
+
+  if (error != NULL)
+    {
+      /* A timeout = nothing left queued = drain complete (the normal exit).
+       * Any other transport error also stops the drain cleanly rather than
+       * masking a real fault as a busy-loop. Either way it is NOT propagated
+       * as a failure — the drain is best-effort. */
+      g_clear_error (&error);
+      fpi_ssm_mark_completed (ssm);
+      return;
+    }
+
+  /* Got (and discarded) an event. Keep draining until the queue empties
+   * (a read times out) or the read budget is spent. */
+  if (ctx->reads_left > 0)
+    ctx->reads_left--;
+  if (ctx->reads_left == 0)
+    {
+      fpi_ssm_mark_completed (ssm);
+      return;
+    }
+  fpi_ssm_jump_to_state (ssm, VERIMARK_DRAIN_STATE_READ);
+}
+
+static void
+drain_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+{
+  VerimarkDrainCtx *ctx = fpi_ssm_get_data (ssm);
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case VERIMARK_DRAIN_STATE_READ:
+      {
+        FpiUsbTransfer *transfer = fpi_usb_transfer_new (dev);
+
+        fpi_usb_transfer_fill_interrupt (transfer, ctx->ep, VERIMARK_INTR_MAXPKT);
+        fpi_usb_transfer_submit (transfer, VERIMARK_INTR_DRAIN_ASYNC_TIMEOUT_MS,
+                                 ctx->cancellable, on_intr_drain_read_done, ssm);
+        break;
+      }
+
+    default:
+      g_assert_not_reached ();
+    }
+}
+
+static void
+drain_ssm_completed (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  VerimarkDrainCtx *ctx = fpi_ssm_get_data (ssm);
+
+  /* The drain never marks itself failed (best-effort), but a cancellation can
+   * still surface here — pass it through so the caller can stop. */
+  ctx->callback (dev, error, ctx->user_data);
+}
+
+void
+verimark_intr_drain_async (FpDevice             *dev,
+                           GCancellable         *cancellable,
+                           VerimarkDrainCallback callback,
+                           gpointer              user_data)
+{
+  FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK (dev);
+  VerimarkDrainCtx *ctx;
+  FpiSsm *ssm;
+
+  g_return_if_fail (FP_IS_DEVICE (dev));
+  g_return_if_fail (callback != NULL);
+
+  ctx = g_new0 (VerimarkDrainCtx, 1);
+  ctx->ep = self->ep_intr_in != 0 ? self->ep_intr_in : VERIMARK_EP_INTR_IN;
+  ctx->reads_left = VERIMARK_INTR_DRAIN_ASYNC_MAX_READS;
+  ctx->cancellable = cancellable != NULL ? g_object_ref (cancellable) : NULL;
+  ctx->callback = callback;
+  ctx->user_data = user_data;
+
+  ssm = fpi_ssm_new (dev, drain_ssm_handler, VERIMARK_DRAIN_N_STATES);
+  fpi_ssm_set_data (ssm, ctx, (GDestroyNotify) verimark_drain_ctx_free);
+  fpi_ssm_start (ssm, drain_ssm_completed);
+}
+
+/* =============================================================================
+ * verimark_intr_drain_sync — phantom-press fix (see verimark-transport.h).
+ *
+ * Stale queued 0x83 events (typically a leftover FINGER_PRESS from the
+ * previous swipe settling, or FINGER_REMOVE) sit in the kernel/libusb
+ * interrupt-transfer queue until read. verimark_intr_wait_async() above
+ * accepts the very first matching event it sees, so a stale one satisfies it
+ * instantly (0 ms) — the capture SSM then arms a frame wait for a finger
+ * that is no longer present, and burns the full
+ * VERIMARK_CAPTURE_FRAME_TIMEOUT_MS dead before the caller retries. Draining
+ * synchronously right before arming a fresh wait (and once at dev_open())
+ * ensures only a truly fresh press can satisfy it.
+ * ============================================================================= */
+
+/* Per-read timeout while draining — short because we are only harvesting
+ * events that are ALREADY queued; a real "nothing queued" timeout here is
+ * the normal/expected way this loop ends. */
+#define VERIMARK_INTR_DRAIN_TIMEOUT_MS 8
+/* Bounded so a misbehaving device (or a genuine flood of events) can never
+ * make this spin forever. */
+#define VERIMARK_INTR_DRAIN_MAX_READS  16
+
+void
+verimark_intr_drain_sync (FpDevice *dev)
+{
+  FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK (dev);
+  GUsbDevice *usb = fpi_device_get_usb_device (dev);
+  guint8 ep = self->ep_intr_in != 0 ? self->ep_intr_in : VERIMARK_EP_INTR_IN;
+  guint  i;
+
+  g_return_if_fail (FP_IS_DEVICE (dev));
+
+  for (i = 0; i < VERIMARK_INTR_DRAIN_MAX_READS; i++)
+    {
+      guint8 buf[VERIMARK_INTR_MAXPKT];
+      gsize actual_length = 0;
+      GError *error = NULL;
+      gboolean ok;
+
+      ok = g_usb_device_interrupt_transfer (usb, ep, buf, sizeof (buf),
+                                            &actual_length,
+                                            VERIMARK_INTR_DRAIN_TIMEOUT_MS,
+                                            NULL, &error);
+      if (!ok)
+        {
+          /* Timeout (nothing queued, the expected/normal end of the drain)
+           * or any other transport error — either way, stop draining rather
+           * than risk masking a real fault as a busy-loop. */
+          g_clear_error (&error);
+          break;
+        }
+
+      if (actual_length == 0)
+        break;
+    }
+}

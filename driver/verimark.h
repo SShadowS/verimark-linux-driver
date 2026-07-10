@@ -24,6 +24,11 @@
 #include "fpi-ssm.h"
 #include "fpi-usb-transfer.h"
 
+/* TEMP timing instrumentation — remove after tuning.
+ * g_warning-level so it shows up in `journalctl -u fprintd` with no extra
+ * config; VMK-TIME: tag for easy grep. Used from verimark.c/verimark-moc.c. */
+#define VMK_TIME(fmt, ...) g_warning ("VMK-TIME: " fmt, ##__VA_ARGS__)
+
 /* VerimarkPairing is a plain, fully-defined struct (not opaque, unlike
  * VerimarkTls below) -- needed by value/pointer in FpiDeviceVerimark itself
  * (the dev_open()-cached pairing, verimark.c), so pull in its definition
