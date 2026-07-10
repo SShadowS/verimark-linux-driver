@@ -163,18 +163,18 @@ Usage: driver/setup-libfprint-build.sh [options]
 Options:
   --work-dir PATH        Build tree location (default: $HOME/verimark-build,
                           env VERIMARK_WORK_DIR).
-  --libfprint-src PATH    Use this libfprint checkout instead of the bundled
-                          RE reference tree (env VERIMARK_LIBFPRINT_SRC).
-                          RECOMMENDED: a real upstream clone —
-                            git clone https://gitlab.freedesktop.org/libfprint/libfprint.git /path/to/libfprint
-                            driver/setup-libfprint-build.sh --libfprint-src /path/to/libfprint/libfprint
-                          verified 2026-07-10 to compile+link cleanly against
-                          upstream 1.94.10 (findings/52). Default when this
-                          flag is omitted: re/synaTudor-rev/libfprint/libfprint
-                          (the bundled libfprint 1.90.7 RE reference tree —
-                          fine for early compile-error iteration, but older
-                          and not what was build-verified; see the header
-                          comment for the one known API gap at that version).
+  --libfprint-src PATH    Use this libfprint checkout (env VERIMARK_LIBFPRINT_SRC)
+                          instead of the default. DEFAULT (flag omitted): the
+                          script CLONES a fresh upstream libfprint into
+                          $WORK_DIR/upstream-libfprint — verified 2026-07-10 to
+                          compile+link cleanly against upstream 1.94.10
+                          (findings/52). Pass an existing checkout to skip the
+                          clone, e.g. --libfprint-src /path/to/libfprint. The
+                          bundled RE reference tree (re/synaTudor-rev/libfprint/
+                          libfprint, libfprint 1.90.7) is NO LONGER the default —
+                          it is too old to compile this driver and carries an
+                          unrelated python3-embed 'tudor' dep; pass it explicitly
+                          only for early compile-error iteration.
   --drivers LIST          -Ddrivers= value (default: verimark). Pass
                           "default" to build every normal driver plus
                           verimark (safe to `meson install` over the system
@@ -229,7 +229,17 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -n "$LIBFPRINT_SRC" ] || LIBFPRINT_SRC="$REF_LIBFPRINT_SRC"
+# Default source is a fresh UPSTREAM libfprint clone. The bundled RE reference
+# clone ($REF_LIBFPRINT_SRC) is libfprint 1.90.7 — too old to compile this driver
+# (no FP_DEVICE_FEATURE_*/clear_storage) AND it carries an unrelated python3-embed
+# 'tudor' driver — so it is NOT the default; pass it explicitly via
+# --libfprint-src "$REF_LIBFPRINT_SRC" only for early compile-error iteration.
+UPSTREAM_URL="https://gitlab.freedesktop.org/libfprint/libfprint.git"
+AUTO_CLONE=0
+if [ -z "$LIBFPRINT_SRC" ]; then
+  LIBFPRINT_SRC="$WORK_DIR/upstream-libfprint"
+  AUTO_CLONE=1
+fi
 
 LIBFPRINT_WORK="$WORK_DIR/libfprint"          # copy of the libfprint git-repo root (LEVEL2 dir)
 LEVEL2_MESON="$LIBFPRINT_WORK/meson.build"
@@ -265,6 +275,15 @@ fi
 
 # ---- 2. Prepare the libfprint work tree ------------------------------------
 if [ "$DO_COPY" -eq 1 ]; then
+  # Auto-clone a fresh upstream libfprint when no --libfprint-src was given.
+  if [ "$AUTO_CLONE" -eq 1 ] && { [ ! -d "$LIBFPRINT_SRC" ] || [ ! -f "$LIBFPRINT_SRC/meson.build" ]; }; then
+    log "No --libfprint-src given — cloning upstream libfprint -> $LIBFPRINT_SRC"
+    command -v git >/dev/null 2>&1 || die "git not found (needed to auto-clone upstream libfprint); install git or pass --libfprint-src <checkout>"
+    mkdir -p "$WORK_DIR"
+    rm -rf "$LIBFPRINT_SRC"
+    git clone --depth 1 "$UPSTREAM_URL" "$LIBFPRINT_SRC" \
+      || die "git clone of upstream libfprint failed (network?) — clone it manually and re-run with --libfprint-src <checkout>"
+  fi
   if [ ! -d "$LIBFPRINT_SRC" ] || [ ! -f "$LIBFPRINT_SRC/meson.build" ]; then
     die "libfprint source tree not found or invalid: $LIBFPRINT_SRC
 MANUAL STEP: either
@@ -280,7 +299,20 @@ MANUAL STEP: either
       (re/ is gitignored on purpose — proprietary/RE material, never committed)"
   fi
 
-  if [ "$RECOPY_TREE" -eq 1 ] || [ ! -f "$LEVEL2_MESON" ]; then
+  # Stamp the work tree with the source it was copied from, and force a fresh
+  # copy whenever that stamp is missing or differs from the requested source.
+  # Without this, an existing $WORK_DIR/libfprint left over from a PRIOR run
+  # against a DIFFERENT source (e.g. the old 1.90.7 RE reference clone) would be
+  # silently reused while the log claims the newly-requested source — which is
+  # exactly how a stale tree (and its bundled python3-embed 'tudor' driver) got
+  # built by mistake. Cheap reuse is kept only for same-source re-runs.
+  SRC_ABS="$(cd "$LIBFPRINT_SRC" && pwd -P)"
+  SRC_STAMP="$LIBFPRINT_WORK/.verimark-src"
+  WORK_SRC=""; [ -f "$SRC_STAMP" ] && WORK_SRC="$(cat "$SRC_STAMP" 2>/dev/null || true)"
+  if [ "$RECOPY_TREE" -eq 1 ] || [ ! -f "$LEVEL2_MESON" ] || [ "$WORK_SRC" != "$SRC_ABS" ]; then
+    if [ -f "$LEVEL2_MESON" ] && [ "$RECOPY_TREE" -ne 1 ] && [ "$WORK_SRC" != "$SRC_ABS" ]; then
+      log "Existing work tree came from a different source ('${WORK_SRC:-unknown}' != '$SRC_ABS') — refreshing"
+    fi
     log "Copying libfprint source tree -> $LIBFPRINT_WORK (leaves $LIBFPRINT_SRC untouched)"
     mkdir -p "$WORK_DIR"
     rm -rf "$LIBFPRINT_WORK"
@@ -291,8 +323,9 @@ MANUAL STEP: either
       cp -a "$LIBFPRINT_SRC" "$LIBFPRINT_WORK"
       rm -rf "$LIBFPRINT_WORK/.git" "$LIBFPRINT_WORK/build"
     fi
+    printf '%s\n' "$SRC_ABS" > "$SRC_STAMP"
   else
-    log "Reusing existing work tree at $LIBFPRINT_WORK (pass --recopy to refresh from source)"
+    log "Reusing existing work tree at $LIBFPRINT_WORK (same source; pass --recopy to force refresh)"
   fi
 
   # ---- 2a. Copy the driver sources in -----------------------------------
