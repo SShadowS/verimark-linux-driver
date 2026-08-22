@@ -1,0 +1,118 @@
+From d67f1bf7a03a9d20f9245be80f8cdb83f4761090 Mon Sep 17 00:00:00 2001
+From: LocalChanges <local@localchanges>
+Date: Tue, 18 Aug 2026 09:16:00 +0200
+Subject: [PATCH] verimark: self-pair on first open + persist to env file
+
+Re-enable automatic first-pairing for the Kensington transport (the upstream
+patch failed closed to force an out-of-band guarded pairing tool) and make
+store_pairing_data() write the pairing to SYNA_TLSMOC_PERSISTENT_DATA_FILE
+(0600, owner-only) so it survives restarts under stock fprintd. Result: a
+single 'fprintd-enroll' pairs + enrolls, no separate pairing step.
+---
+ .../libfprint/drivers/synatlsmoc/synatlsmoc.c | 68 ++++++++++++++++---
+ 1 file changed, 58 insertions(+), 10 deletions(-)
+
+diff --git a/libfprint/libfprint/libfprint/drivers/synatlsmoc/synatlsmoc.c b/libfprint/libfprint/libfprint/drivers/synatlsmoc/synatlsmoc.c
+index be037a4..81d3ce6 100644
+--- a/libfprint/libfprint/libfprint/drivers/synatlsmoc/synatlsmoc.c
++++ b/libfprint/libfprint/libfprint/drivers/synatlsmoc/synatlsmoc.c
+@@ -27,6 +27,7 @@
+ #define FP_COMPONENT "synatlsmoc"
+ 
+ #include <errno.h>
++#include <fcntl.h>
+ #include <glib.h>
+ #include <glib/gstdio.h>
+ #include <openssl/decoder.h>
+@@ -3288,6 +3289,52 @@ store_pairing_data (FpiDeviceSynaTlsMoc *self)
+ 
+   fp_dbg ("Successfully stored pairing data");
+ 
++  /* LocalChanges: self-persist the pairing to the env-var file. Stock fprintd
++   * does not persist the fpi-persistent-data property, so without this the
++   * freshly-paired state would be lost on the next open. We serialise via
++   * fp_device_get_persistent_data() (the exact "(issv)" framing that
++   * load_persistent_data_file()/fp_device_set_persistent_data() expect) and
++   * write it owner-only 0600, which is what load_persistent_data_file()
++   * enforces. */
++  {
++    const gchar *persistent_path = g_getenv (SYNATLSMOC_PERSISTENT_DATA_ENV);
++
++    if (synatlsmoc_uses_kensington_transport (self) &&
++        persistent_path != NULL && persistent_path[0] != '\0')
++      {
++        g_autofree guchar *blob = NULL;
++        gsize blob_len = 0;
++        g_autoptr (GError) werr = NULL;
++        int fd;
++
++        if (!fp_device_get_persistent_data (FP_DEVICE (self), &blob, &blob_len,
++                                            &werr))
++          {
++            fpi_ssm_mark_failed (self->task_ssm, g_steal_pointer (&werr));
++            return;
++          }
++
++        fd = g_open (persistent_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
++        if (fd < 0 || fchmod (fd, 0600) != 0 ||
++            (blob_len > 0 &&
++             write (fd, blob, blob_len) != (gssize) blob_len))
++          {
++            int saved_errno = errno;
++            if (fd >= 0)
++              close (fd);
++            fpi_ssm_mark_failed (
++                self->task_ssm,
++                set_and_report_error (
++                    FP_DEVICE_ERROR_GENERAL,
++                    "Cannot write persistent pairing file %s: %s",
++                    persistent_path, g_strerror (saved_errno)));
++            return;
++          }
++        close (fd);
++        fp_dbg ("Wrote persistent pairing file (%zu bytes)", blob_len);
++      }
++  }
++
+   fpi_ssm_next_state (self->task_ssm);
+ }
+ 
+@@ -3490,8 +3537,12 @@ fetch_pairing_data (FpiDeviceSynaTlsMoc *self)
+   g_object_get (FP_DEVICE (self), "fpi-persistent-data", &pairing_data, NULL);
+ 
+   persistent_path = g_getenv (SYNATLSMOC_PERSISTENT_DATA_ENV);
++  /* LocalChanges: only load when the file already EXISTS. A missing file means
++   * "not paired yet" and must fall through to automatic first-pairing below,
++   * NOT hard-fail (load_persistent_data_file() errors on ENOENT). */
+   if (pairing_data == NULL && synatlsmoc_uses_kensington_transport (self) &&
+-      persistent_path && persistent_path[0] != '\0')
++      persistent_path && persistent_path[0] != '\0' &&
++      g_file_test (persistent_path, G_FILE_TEST_EXISTS))
+     {
+       g_autoptr (GError) error = NULL;
+ 
+@@ -3504,15 +3555,12 @@ fetch_pairing_data (FpiDeviceSynaTlsMoc *self)
+                     NULL);
+     }
+ 
+-  if (pairing_data == NULL && synatlsmoc_uses_kensington_transport (self))
+-    {
+-      fpi_ssm_mark_failed (
+-          self->task_ssm,
+-          set_and_report_error (
+-              FP_DEVICE_ERROR_NOT_SUPPORTED,
+-              "Kensington pairing data is required; automatic pairing is disabled"));
+-      return;
+-    }
++  /* LocalChanges: automatic first-pairing is ENABLED for Kensington (the
++   * upstream patch failed closed here to force its guarded out-of-band pairing
++   * tool). When no persistent pairing file exists yet, fall through to
++   * OPEN_SEND_PAIR below; store_pairing_data() then self-persists the result to
++   * SYNA_TLSMOC_PERSISTENT_DATA_FILE so the pairing survives across restarts
++   * with stock fprintd. This makes `fprintd-enroll` a one-step setup. */
+ 
+   if ((!synatlsmoc_is_provisioned (self)) || pairing_data == NULL)
+     {
+-- 
+2.55.0
+

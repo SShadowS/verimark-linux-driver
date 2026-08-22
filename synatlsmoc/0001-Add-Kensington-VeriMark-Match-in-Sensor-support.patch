@@ -1,0 +1,2632 @@
+From 108870f04d6f6275fce395900b5a5d13a8506444 Mon Sep 17 00:00:00 2001
+From: Uriziel01 <p.borecki90@gmail.com>
+Date: Tue, 11 Aug 2026 22:13:48 +0200
+Subject: [PATCH] Add Kensington VeriMark Match-in-Sensor support
+
+---
+ libfprint/libfprint/examples/meson.build      |  12 +
+ libfprint/libfprint/examples/verimark-smoke.c | 593 +++++++++++++++
+ .../drivers/synatlsmoc/kensington_transport.c | 171 +++++
+ .../drivers/synatlsmoc/kensington_transport.h |  56 ++
+ .../libfprint/drivers/synatlsmoc/synatlsmoc.c | 683 +++++++++++++-----
+ .../libfprint/drivers/synatlsmoc/synatlsmoc.h |  27 +
+ .../drivers/synatlsmoc/tls_session.c          |  76 +-
+ .../libfprint/fprint-list-udev-hwdb.c         |   3 -
+ libfprint/libfprint/libfprint/meson.build     |   1 +
+ libfprint/libfprint/tests/meson.build         |  16 +
+ .../tests/test-synatlsmoc-kensington.c        | 166 +++++
+ 11 files changed, 1561 insertions(+), 243 deletions(-)
+ create mode 100644 libfprint/libfprint/examples/verimark-smoke.c
+ create mode 100644 libfprint/libfprint/libfprint/drivers/synatlsmoc/kensington_transport.c
+ create mode 100644 libfprint/libfprint/libfprint/drivers/synatlsmoc/kensington_transport.h
+ create mode 100644 libfprint/libfprint/tests/test-synatlsmoc-kensington.c
+
+diff --git a/libfprint/libfprint/examples/meson.build b/libfprint/libfprint/examples/meson.build
+index f28a2d4..53991c5 100644
+--- a/libfprint/libfprint/examples/meson.build
++++ b/libfprint/libfprint/examples/meson.build
+@@ -13,10 +13,22 @@ foreach example: examples
+         dependencies: [
+             libfprint_dep,
+             glib_dep,
++            gusb_dep,
+         ],
+     )
+ endforeach
+ 
++if 'synatlsmoc' in drivers
++    executable('verimark-smoke',
++        'verimark-smoke.c',
++        dependencies: [
++            libfprint_dep,
++            glib_dep,
++        ],
++        install: false,
++    )
++endif
++
+ executable('cpp-test',
+     'cpp-test.cpp',
+     dependencies: libfprint_dep,
+diff --git a/libfprint/libfprint/examples/verimark-smoke.c b/libfprint/libfprint/examples/verimark-smoke.c
+new file mode 100644
+index 0000000..04d0065
+--- /dev/null
++++ b/libfprint/libfprint/examples/verimark-smoke.c
+@@ -0,0 +1,593 @@
++/*
++ * Private live smoke test for the Kensington VeriMark Desktop integration.
++ *
++ * This helper never deletes, formats, pairs, or prints template metadata. It
++ * loads already-approved libfprint persistent pairing data,
++ * opens the device, and performs bounded list/identify/verify/recovery tests.
++ * Enrollment is available only with an exact, explicit approval token.
++ */
++
++#define FP_COMPONENT "verimark-smoke"
++#define ENROLL_APPROVAL_TOKEN "CREATE_ONE_LIBFPRINT_TEST_ENROLLMENT"
++
++#include <glib-unix.h>
++#include <glib/gstdio.h>
++#include <gusb.h>
++#include <libfprint/fprint.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <sys/stat.h>
++
++typedef enum
++{
++  OP_LIST,
++  OP_IDENTIFY,
++  OP_VERIFY,
++  OP_CANCEL_RECOVER,
++  OP_REMOVE,
++  OP_ENROLL,
++} SmokeOperation;
++
++typedef struct
++{
++  FpContext *context;
++  FpDevice *device;
++  GMainLoop *loop;
++  GCancellable *cancellable;
++  GPtrArray *prints;
++
++  gchar *persistent_path;
++  gchar *operation_name;
++  gchar *expect_name;
++  gchar *approval_token;
++  gchar *finger_name;
++  gint print_index;
++  guint cancel_after_ms;
++  guint cancel_source;
++  guint sigint_source;
++
++  SmokeOperation operation;
++  gboolean expect_match;
++  gboolean action_match;
++  gboolean cancel_requested;
++  gboolean cancellation_observed;
++  gboolean removal_observed;
++  gboolean enrollment_committed;
++  gboolean recovery_started;
++  gboolean success;
++  FpFinger selected_finger;
++  const gchar *failure_stage;
++} SmokeData;
++
++static void
++smoke_data_free (SmokeData *data)
++{
++  g_clear_handle_id (&data->cancel_source, g_source_remove);
++  g_clear_handle_id (&data->sigint_source, g_source_remove);
++  g_clear_pointer (&data->prints, g_ptr_array_unref);
++  g_clear_object (&data->cancellable);
++  g_clear_pointer (&data->loop, g_main_loop_unref);
++  g_clear_object (&data->context);
++  g_clear_pointer (&data->persistent_path, g_free);
++  g_clear_pointer (&data->operation_name, g_free);
++  g_clear_pointer (&data->expect_name, g_free);
++  g_clear_pointer (&data->approval_token, g_free);
++  g_clear_pointer (&data->finger_name, g_free);
++  g_free (data);
++}
++
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (SmokeData, smoke_data_free)
++
++static void
++print_report (SmokeData *data)
++{
++  g_print ("{\n");
++  g_print ("  \"cancellation_observed\": %s,\n",
++           data->cancellation_observed ? "true" : "false");
++  g_print ("  \"enrollment_committed\": %s,\n",
++           data->enrollment_committed ? "true" : "false");
++  g_print ("  \"enrollment_write_approved\": %s,\n",
++           data->operation == OP_ENROLL ? "true" : "false");
++  if (data->failure_stage)
++    g_print ("  \"failure_stage\": \"%s\",\n", data->failure_stage);
++  else
++    g_print ("  \"failure_stage\": null,\n");
++  g_print ("  \"hid_interface_touched\": false,\n");
++  g_print ("  \"operation\": \"%s\",\n", data->operation_name);
++  g_print ("  \"pairing_material_logged\": false,\n");
++  g_print ("  \"print_count\": %u,\n",
++           data->prints ? data->prints->len : 0);
++  g_print ("  \"reader_state_changed\": %s,\n",
++           data->operation == OP_ENROLL ? "true" : "false");
++  g_print ("  \"removal_observed\": %s,\n",
++           data->removal_observed ? "true" : "false");
++  g_print ("  \"result\": %s,\n",
++           data->operation == OP_LIST || data->operation == OP_REMOVE ||
++                   data->operation == OP_ENROLL
++               ? "null"
++               : (data->action_match ? "\"match\"" : "\"nonmatch\""));
++  g_print ("  \"success\": %s,\n", data->success ? "true" : "false");
++  g_print ("  \"template_identifiers_logged\": false\n");
++  g_print ("}\n");
++}
++
++static gboolean
++is_removal_error (GError *error)
++{
++  return error &&
++         (g_error_matches (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_REMOVED) ||
++          g_error_matches (error, G_USB_DEVICE_ERROR,
++                           G_USB_DEVICE_ERROR_NO_DEVICE));
++}
++
++static void
++on_device_closed (FpDevice     *device,
++                  GAsyncResult *result,
++                  gpointer      user_data)
++{
++  SmokeData *data = user_data;
++  g_autoptr (GError) error = NULL;
++
++  if (!fp_device_close_finish (device, result, &error) &&
++      !(data->operation == OP_REMOVE && data->removal_observed &&
++        is_removal_error (error)))
++    {
++      data->success = FALSE;
++      data->failure_stage = "close";
++      g_warning ("Device close failed: %s", error->message);
++    }
++
++  print_report (data);
++  g_main_loop_quit (data->loop);
++}
++
++static void
++finish_and_close (SmokeData *data,
++                  gboolean   success,
++                  const char *failure_stage)
++{
++  data->success = success;
++  data->failure_stage = failure_stage;
++  g_clear_handle_id (&data->cancel_source, g_source_remove);
++
++  if (fp_device_is_open (data->device))
++    fp_device_close (data->device, NULL,
++                     (GAsyncReadyCallback) on_device_closed, data);
++  else
++    {
++      print_report (data);
++      g_main_loop_quit (data->loop);
++    }
++}
++
++static void start_action (SmokeData *data);
++
++static void
++on_enroll_progress (FpDevice *device,
++                    gint      completed_stages,
++                    FpPrint  *print,
++                    gpointer  user_data,
++                    GError   *error)
++{
++  if (error)
++    g_print ("Sample rejected (%s). Lift the right little finger completely, "
++             "then touch it again.\n", error->message);
++  else
++    g_print ("Sample accepted; sensor stage %d of %d. Lift the right little "
++             "finger completely, then touch it again.\n",
++             completed_stages, fp_device_get_nr_enroll_stages (device));
++}
++
++static void
++on_enroll_finished (FpDevice     *device,
++                    GAsyncResult *result,
++                    gpointer      user_data)
++{
++  SmokeData *data = user_data;
++  g_autoptr (FpPrint) print = NULL;
++  g_autoptr (GError) error = NULL;
++
++  print = fp_device_enroll_finish (device, result, &error);
++  if (!print)
++    {
++      g_warning ("Enrollment failed: %s", error->message);
++      finish_and_close (data, FALSE, "enroll");
++      return;
++    }
++
++  data->enrollment_committed = fp_print_get_device_stored (print);
++  if (!data->enrollment_committed)
++    {
++      g_warning ("Enrollment completed without a device-stored print");
++      finish_and_close (data, FALSE, "enroll-storage");
++      return;
++    }
++
++  finish_and_close (data, TRUE, NULL);
++}
++
++static gboolean
++cancel_action_cb (gpointer user_data)
++{
++  SmokeData *data = user_data;
++
++  data->cancel_source = 0;
++  data->cancel_requested = TRUE;
++  g_print ("Cancelling the first identification; do not touch the reader yet.\n");
++  g_cancellable_cancel (data->cancellable);
++  return G_SOURCE_REMOVE;
++}
++
++static void
++match_cb (FpDevice *device,
++          FpPrint  *match,
++          FpPrint  *print,
++          gpointer  user_data,
++          GError   *error)
++{
++  SmokeData *data = user_data;
++
++  if (!error)
++    data->action_match = match != NULL;
++}
++
++static void
++on_identify_finished (FpDevice     *device,
++                      GAsyncResult *result,
++                      gpointer      user_data)
++{
++  SmokeData *data = user_data;
++  g_autoptr (FpPrint) match = NULL;
++  g_autoptr (FpPrint) print = NULL;
++  g_autoptr (GError) error = NULL;
++  gboolean completed;
++
++  completed = fp_device_identify_finish (device, result, &match, &print, &error);
++  data->action_match = match != NULL;
++
++  if (data->operation == OP_REMOVE)
++    {
++      if (!completed && is_removal_error (error))
++        {
++          data->removal_observed = TRUE;
++          finish_and_close (data, TRUE, NULL);
++          return;
++        }
++
++      g_warning ("Identification did not report physical device removal");
++      finish_and_close (data, FALSE, "removal");
++      return;
++    }
++
++  if (data->operation == OP_CANCEL_RECOVER && !data->recovery_started)
++    {
++      if (completed || !data->cancel_requested || error == NULL)
++        {
++          g_warning ("Identification did not report the requested cancellation");
++          finish_and_close (data, FALSE, "cancel");
++          return;
++        }
++
++      data->cancellation_observed = TRUE;
++      data->recovery_started = TRUE;
++      data->cancel_requested = FALSE;
++      g_clear_object (&data->cancellable);
++      data->cancellable = g_cancellable_new ();
++      g_print ("Cancellation cleanup completed. Touch the enrolled finger now.\n");
++      start_action (data);
++      return;
++    }
++
++  if (!completed)
++    {
++      g_warning ("Identification failed: %s", error->message);
++      finish_and_close (data, FALSE, "identify");
++      return;
++    }
++
++  finish_and_close (data, data->action_match == data->expect_match,
++                    data->action_match == data->expect_match ? NULL
++                                                            : "expectation");
++}
++
++static void
++on_verify_finished (FpDevice     *device,
++                    GAsyncResult *result,
++                    gpointer      user_data)
++{
++  SmokeData *data = user_data;
++  g_autoptr (FpPrint) print = NULL;
++  g_autoptr (GError) error = NULL;
++  gboolean match = FALSE;
++
++  if (!fp_device_verify_finish (device, result, &match, &print, &error))
++    {
++      g_warning ("Verification failed: %s", error->message);
++      finish_and_close (data, FALSE, "verify");
++      return;
++    }
++
++  data->action_match = match;
++  finish_and_close (data, match == data->expect_match,
++                    match == data->expect_match ? NULL : "expectation");
++}
++
++static void
++start_action (SmokeData *data)
++{
++  data->action_match = FALSE;
++
++  if (data->operation == OP_ENROLL)
++    {
++      FpPrint *template = fp_print_new (data->device);
++
++      fp_print_set_finger (template, FP_FINGER_RIGHT_LITTLE);
++      fp_print_set_username (template, "verimark-step14-test");
++      g_print ("Enrollment will write one new right-little-finger template.\n");
++      g_print ("Lift the right little finger completely, then touch it.\n");
++      fp_device_enroll (data->device, template, data->cancellable,
++                        on_enroll_progress, data, NULL,
++                        (GAsyncReadyCallback) on_enroll_finished, data);
++      return;
++    }
++
++  if (data->operation == OP_VERIFY)
++    {
++      guint index;
++
++      if (data->selected_finger != FP_FINGER_UNKNOWN)
++        {
++          guint matches = 0;
++
++          index = 0;
++          for (guint i = 0; i < data->prints->len; i++)
++            {
++              FpPrint *print = g_ptr_array_index (data->prints, i);
++
++              if (fp_print_get_finger (print) == data->selected_finger)
++                {
++                  index = i;
++                  matches++;
++                }
++            }
++          if (matches != 1)
++            {
++              g_warning ("Expected exactly one stored print for --finger");
++              finish_and_close (data, FALSE, "finger-selection");
++              return;
++            }
++        }
++      else if (data->print_index < 0 && data->prints->len == 1)
++        index = 0;
++      else if (data->print_index >= 0 &&
++               (guint) data->print_index < data->prints->len)
++        index = data->print_index;
++      else
++        {
++          g_warning ("Use --print-index when more than one print is stored");
++          finish_and_close (data, FALSE, "print-selection");
++          return;
++        }
++
++      g_print ("Touch the fingerprint reader once.\n");
++      fp_device_verify (data->device, g_ptr_array_index (data->prints, index),
++                        data->cancellable, match_cb, data, NULL,
++                        (GAsyncReadyCallback) on_verify_finished, data);
++      return;
++    }
++
++  if (data->operation == OP_CANCEL_RECOVER && !data->recovery_started)
++    {
++      g_print ("Starting identification; keep your finger away.\n");
++      data->cancel_source = g_timeout_add (data->cancel_after_ms,
++                                           cancel_action_cb, data);
++    }
++  else if (data->operation == OP_REMOVE)
++    g_print ("Unplug the fingerprint reader now; do not touch it.\n");
++  else
++    g_print ("Touch the fingerprint reader once.\n");
++
++  fp_device_identify (data->device, data->prints, data->cancellable,
++                      match_cb, data, NULL,
++                      (GAsyncReadyCallback) on_identify_finished, data);
++}
++
++static void
++on_prints_listed (FpDevice     *device,
++                  GAsyncResult *result,
++                  gpointer      user_data)
++{
++  SmokeData *data = user_data;
++  g_autoptr (GError) error = NULL;
++
++  data->prints = fp_device_list_prints_finish (device, result, &error);
++  if (!data->prints)
++    {
++      g_warning ("Print listing failed: %s", error->message);
++      finish_and_close (data, FALSE, "list");
++      return;
++    }
++
++  g_print ("Sensor reports %u stored print(s); identifiers are not displayed.\n",
++           data->prints->len);
++
++  if (data->operation == OP_LIST)
++    {
++      finish_and_close (data, TRUE, NULL);
++      return;
++    }
++  if (data->prints->len == 0 && data->operation != OP_ENROLL)
++    {
++      finish_and_close (data, FALSE, "empty-storage");
++      return;
++    }
++
++  start_action (data);
++}
++
++static void
++on_device_opened (FpDevice     *device,
++                  GAsyncResult *result,
++                  gpointer      user_data)
++{
++  SmokeData *data = user_data;
++  g_autoptr (GError) error = NULL;
++
++  if (!fp_device_open_finish (device, result, &error))
++    {
++      g_warning ("Device open failed: %s", error->message);
++      finish_and_close (data, FALSE, "open");
++      return;
++    }
++
++  fp_device_list_prints (device, data->cancellable,
++                         (GAsyncReadyCallback) on_prints_listed, data);
++}
++
++static gboolean
++sigint_cb (gpointer user_data)
++{
++  SmokeData *data = user_data;
++
++  g_cancellable_cancel (data->cancellable);
++  return G_SOURCE_CONTINUE;
++}
++
++static gboolean
++parse_operation (SmokeData *data)
++{
++  if (g_strcmp0 (data->operation_name, "list") == 0)
++    data->operation = OP_LIST;
++  else if (g_strcmp0 (data->operation_name, "identify") == 0)
++    data->operation = OP_IDENTIFY;
++  else if (g_strcmp0 (data->operation_name, "verify") == 0)
++    data->operation = OP_VERIFY;
++  else if (g_strcmp0 (data->operation_name, "cancel-recover") == 0)
++    data->operation = OP_CANCEL_RECOVER;
++  else if (g_strcmp0 (data->operation_name, "remove") == 0)
++    data->operation = OP_REMOVE;
++  else if (g_strcmp0 (data->operation_name, "enroll") == 0)
++    data->operation = OP_ENROLL;
++  else
++    return FALSE;
++
++  if (g_strcmp0 (data->expect_name, "match") == 0)
++    data->expect_match = TRUE;
++  else if (g_strcmp0 (data->expect_name, "nonmatch") == 0)
++    data->expect_match = FALSE;
++  else
++    return FALSE;
++
++  return TRUE;
++}
++
++int
++main (int argc, char **argv)
++{
++  g_autoptr (SmokeData) data = g_new0 (SmokeData, 1);
++  g_autoptr (GOptionContext) options = NULL;
++  g_autoptr (GError) error = NULL;
++  g_autofree gchar *persistent = NULL;
++  gsize persistent_size = 0;
++  GPtrArray *devices;
++  struct stat persistent_stat;
++  guint found = 0;
++  gint exit_status;
++  GOptionEntry entries[] = {
++    { "persistent", 0, 0, G_OPTION_ARG_FILENAME, &data->persistent_path,
++      "Mode-0600 libfprint persistent pairing file", "PATH" },
++    { "operation", 0, 0, G_OPTION_ARG_STRING, &data->operation_name,
++      "list, identify, verify, cancel-recover, remove, or enroll", "NAME" },
++    { "expect", 0, 0, G_OPTION_ARG_STRING, &data->expect_name,
++      "Expected biometric result: match or nonmatch", "RESULT" },
++    { "print-index", 0, 0, G_OPTION_ARG_INT, &data->print_index,
++      "Zero-based stored print index for verify", "N" },
++    { "finger", 0, 0, G_OPTION_ARG_STRING, &data->finger_name,
++      "Stored finger label for verify (right-little)", "NAME" },
++    { "cancel-after-ms", 0, 0, G_OPTION_ARG_INT, &data->cancel_after_ms,
++      "Cancellation delay for cancel-recover", "MS" },
++    { "approval-token", 0, 0, G_OPTION_ARG_STRING, &data->approval_token,
++      "Exact approval token required for enrollment", "TOKEN" },
++    { NULL }
++  };
++
++  data->operation_name = g_strdup ("list");
++  data->expect_name = g_strdup ("match");
++  data->print_index = -1;
++  data->cancel_after_ms = 1200;
++  options = g_option_context_new ("- private VeriMark libfprint smoke test");
++  g_option_context_add_main_entries (options, entries, NULL);
++  if (!g_option_context_parse (options, &argc, &argv, &error) ||
++      !data->persistent_path || !parse_operation (data))
++    {
++      g_printerr ("Invalid arguments: %s\n",
++                  error ? error->message : "check --help");
++      return EXIT_FAILURE;
++    }
++  if (data->operation == OP_ENROLL &&
++      g_strcmp0 (data->approval_token, ENROLL_APPROVAL_TOKEN) != 0)
++    {
++      g_printerr ("Enrollment requires the exact approval token.\n");
++      return EXIT_FAILURE;
++    }
++  if (data->finger_name)
++    {
++      if (data->operation != OP_VERIFY || data->print_index >= 0 ||
++          g_strcmp0 (data->finger_name, "right-little") != 0)
++        {
++          g_printerr ("--finger right-little is valid only for verify and "
++                      "cannot be combined with --print-index.\n");
++          return EXIT_FAILURE;
++        }
++      data->selected_finger = FP_FINGER_RIGHT_LITTLE;
++    }
++
++  if (g_stat (data->persistent_path, &persistent_stat) != 0 ||
++      !S_ISREG (persistent_stat.st_mode) ||
++      (persistent_stat.st_mode & 0777) != 0600)
++    {
++      g_printerr ("Persistent pairing data must be a regular mode-0600 file.\n");
++      return EXIT_FAILURE;
++    }
++  if (!g_file_get_contents (data->persistent_path, &persistent,
++                            &persistent_size, &error))
++    {
++      g_printerr ("Cannot read persistent pairing data: %s\n", error->message);
++      return EXIT_FAILURE;
++    }
++
++  data->context = fp_context_new ();
++  devices = fp_context_get_devices (data->context);
++  for (guint i = 0; devices && i < devices->len; i++)
++    {
++      FpDevice *candidate = g_ptr_array_index (devices, i);
++
++      if (g_strcmp0 (fp_device_get_driver (candidate), "synatlsmoc") == 0)
++        {
++          data->device = candidate;
++          found++;
++        }
++    }
++  if (found != 1)
++    {
++      g_printerr ("Expected exactly one synatlsmoc device, found %u.\n", found);
++      return EXIT_FAILURE;
++    }
++  if (!fp_device_set_persistent_data (data->device, (guchar *) persistent,
++                                      persistent_size, &error))
++    {
++      g_printerr ("Persistent pairing data was rejected: %s\n", error->message);
++      return EXIT_FAILURE;
++    }
++
++  data->loop = g_main_loop_new (NULL, FALSE);
++  data->cancellable = g_cancellable_new ();
++  data->sigint_source = g_unix_signal_add_full (G_PRIORITY_HIGH, SIGINT,
++                                                sigint_cb, data, NULL);
++  fp_device_open (data->device, data->cancellable,
++                  (GAsyncReadyCallback) on_device_opened, data);
++  g_main_loop_run (data->loop);
++
++  exit_status = data->success ? EXIT_SUCCESS : EXIT_FAILURE;
++  return exit_status;
++}
+diff --git a/libfprint/libfprint/libfprint/drivers/synatlsmoc/kensington_transport.c b/libfprint/libfprint/libfprint/drivers/synatlsmoc/kensington_transport.c
+new file mode 100644
+index 0000000..36a632e
+--- /dev/null
++++ b/libfprint/libfprint/libfprint/drivers/synatlsmoc/kensington_transport.c
+@@ -0,0 +1,171 @@
++/*
++ * Kensington endpoint-zero transport for Synaptics Tudor Match-In-Sensor.
++ *
++ * Copyright (c) 2026 VeriMarkOnLinux contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include "kensington_transport.h"
++
++#include <gio/gio.h>
++#include <string.h>
++
++#define KENSINGTON_TUDOR_ALIGNMENT 8
++
++static gboolean
++validate_control_length (gsize length,
++                         GError **error)
++{
++  if (length == 0 || length > G_MAXUINT16)
++    {
++      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                   "Kensington control length %" G_GSIZE_FORMAT
++                   " is outside the USB control-transfer range",
++                   length);
++      return FALSE;
++    }
++
++  return TRUE;
++}
++
++gboolean
++kensington_transport_prepare_command (const guint8          *logical,
++                                       gsize                  logical_length,
++                                       guint8               **wire,
++                                       KensingtonControlPlan *plan,
++                                       GError               **error)
++{
++  gsize wire_length;
++
++  g_return_val_if_fail (wire != NULL, FALSE);
++  g_return_val_if_fail (plan != NULL, FALSE);
++
++  *wire = NULL;
++  *plan = (KensingtonControlPlan) { 0 };
++
++  if (logical == NULL || logical_length == 0)
++    {
++      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                           "Kensington command must not be empty");
++      return FALSE;
++    }
++
++  if (logical_length > G_MAXSIZE - (KENSINGTON_TUDOR_ALIGNMENT - 1))
++    {
++      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                           "Kensington command length overflows alignment");
++      return FALSE;
++    }
++
++  wire_length = (logical_length + (KENSINGTON_TUDOR_ALIGNMENT - 1)) &
++                ~((gsize) KENSINGTON_TUDOR_ALIGNMENT - 1);
++  if (!validate_control_length (wire_length, error))
++    return FALSE;
++
++  *wire = g_malloc0 (wire_length);
++  memcpy (*wire, logical, logical_length);
++
++  plan->request = KENSINGTON_TUDOR_REQUEST_COMMAND;
++  plan->value = logical_length % KENSINGTON_TUDOR_ALIGNMENT;
++  plan->index = 0;
++  plan->wire_length = wire_length;
++  return TRUE;
++}
++
++gboolean
++kensington_transport_prepare_response (gsize                  expected_length,
++                                        KensingtonControlPlan *plan,
++                                        GError               **error)
++{
++  g_return_val_if_fail (plan != NULL, FALSE);
++
++  *plan = (KensingtonControlPlan) { 0 };
++  if (!validate_control_length (expected_length, error))
++    return FALSE;
++
++  plan->request = KENSINGTON_TUDOR_REQUEST_RESPONSE;
++  plan->value = 0;
++  plan->index = 0;
++  plan->wire_length = expected_length;
++  return TRUE;
++}
++
++void
++kensington_transport_encode_event_mask (
++    guint8 event_masks[KENSINGTON_EVENT_MASK_BYTES],
++    guint32 mask)
++{
++  guint32 mask_le = GUINT32_TO_LE (mask);
++
++  g_return_if_fail (event_masks != NULL);
++
++  /* Windows writes the active mask into event groups 0 and 4 only.  Repeating
++   * it into all eight groups works for basic capture, but changes the capture
++   * indication behaviour on 047d:00f2. */
++  memset (event_masks, 0, KENSINGTON_EVENT_MASK_BYTES);
++  memcpy (event_masks, &mask_le, sizeof (mask_le));
++  memcpy (event_masks + 4 * sizeof (mask_le), &mask_le, sizeof (mask_le));
++}
++
++void
++kensington_transport_build_led_ex2 (
++    guint8 command[KENSINGTON_LED_EX2_COMMAND_SIZE],
++    KensingtonLedEvent event)
++{
++  static const guint8 waiting_block[20] = {
++    0xff, 0xff, 0x00, 0x00, 0x05, 0x7f, 0x00, 0x20, 0x00, 0x00,
++    0x00, 0x00, 0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  };
++  static const guint8 rejected_frames[4][20] = {
++    {
++      0x4b, 0x00, 0x00, 0x00, 0x07, 0x7f, 0x00, 0x20, 0x7f, 0x7f,
++      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    },
++    {
++      0x4b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x20, 0x00, 0x00,
++      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    },
++    {
++      0x4b, 0x00, 0x00, 0x00, 0x01, 0x7f, 0x00, 0x20, 0x00, 0x00,
++      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    },
++    {
++      0x4b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x20, 0x00, 0x00,
++      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    },
++  };
++
++  g_return_if_fail (command != NULL);
++  g_return_if_fail (event == KENSINGTON_LED_EVENT_OFF ||
++                    event == KENSINGTON_LED_EVENT_WAITING ||
++                    event == KENSINGTON_LED_EVENT_REJECTED);
++
++  memset (command, 0, KENSINGTON_LED_EX2_COMMAND_SIZE);
++  command[0] = 0x39;
++
++  switch (event)
++    {
++    case KENSINGTON_LED_EVENT_OFF:
++      for (guint i = 0; i < 6; i++)
++        command[5 + i * 20 + 7] = 0x20;
++      break;
++
++    case KENSINGTON_LED_EVENT_WAITING:
++      command[2] = 0x71;
++      command[3] = 0x02;
++      for (guint i = 0; i < 3; i++)
++        memcpy (command + 5 + i * sizeof (waiting_block), waiting_block,
++                sizeof (waiting_block));
++      break;
++
++    case KENSINGTON_LED_EVENT_REJECTED:
++      command[1] = 0xe8;
++      command[2] = 0x03;
++      memcpy (command + 5, rejected_frames, sizeof (rejected_frames));
++      break;
++    }
++}
+diff --git a/libfprint/libfprint/libfprint/drivers/synatlsmoc/kensington_transport.h b/libfprint/libfprint/libfprint/drivers/synatlsmoc/kensington_transport.h
+new file mode 100644
+index 0000000..7eebcea
+--- /dev/null
++++ b/libfprint/libfprint/libfprint/drivers/synatlsmoc/kensington_transport.h
+@@ -0,0 +1,56 @@
++/*
++ * Kensington endpoint-zero transport for Synaptics Tudor Match-In-Sensor.
++ *
++ * Copyright (c) 2026 VeriMarkOnLinux contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#pragma once
++
++#include <glib.h>
++
++G_BEGIN_DECLS
++
++#define KENSINGTON_TUDOR_REQUEST_COMMAND  0x16
++#define KENSINGTON_TUDOR_REQUEST_RESPONSE 0x17
++#define KENSINGTON_EVENT_MASK_BYTES       32
++#define KENSINGTON_LED_EX2_COMMAND_SIZE   125
++
++typedef enum
++{
++  KENSINGTON_LED_EVENT_OFF = 0,
++  KENSINGTON_LED_EVENT_WAITING = 1,
++  KENSINGTON_LED_EVENT_REJECTED = 5,
++} KensingtonLedEvent;
++
++typedef struct
++{
++  guint8  request;
++  guint16 value;
++  guint16 index;
++  gsize   wire_length;
++} KensingtonControlPlan;
++
++gboolean kensington_transport_prepare_command (const guint8          *logical,
++                                                gsize                  logical_length,
++                                                guint8               **wire,
++                                                KensingtonControlPlan *plan,
++                                                GError               **error);
++
++gboolean kensington_transport_prepare_response (gsize                  expected_length,
++                                                 KensingtonControlPlan *plan,
++                                                 GError               **error);
++
++void kensington_transport_encode_event_mask (
++    guint8 event_masks[KENSINGTON_EVENT_MASK_BYTES],
++    guint32 mask);
++
++void kensington_transport_build_led_ex2 (
++    guint8 command[KENSINGTON_LED_EX2_COMMAND_SIZE],
++    KensingtonLedEvent event);
++
++G_END_DECLS
+diff --git a/libfprint/libfprint/libfprint/drivers/synatlsmoc/synatlsmoc.c b/libfprint/libfprint/libfprint/drivers/synatlsmoc/synatlsmoc.c
+index b4a7add..be037a4 100644
+--- a/libfprint/libfprint/libfprint/drivers/synatlsmoc/synatlsmoc.c
++++ b/libfprint/libfprint/libfprint/drivers/synatlsmoc/synatlsmoc.c
+@@ -26,13 +26,17 @@
+ 
+ #define FP_COMPONENT "synatlsmoc"
+ 
++#include <errno.h>
+ #include <glib.h>
++#include <glib/gstdio.h>
+ #include <openssl/decoder.h>
+ #include <openssl/ec.h>
+ #include <openssl/err.h>
+ #include <openssl/evp.h>
+ #include <openssl/param_build.h>
+ #include <openssl/pem.h>
++#include <sys/stat.h>
++#include <unistd.h>
+ 
+ #include "fpi-byte-reader.h"
+ #include "fpi-byte-writer.h"
+@@ -40,7 +44,10 @@
+ #include "fpi-log.h"
+ #include "fpi-ssm.h"
+ #include "fpi-usb-transfer.h"
++#include "kensington_transport.h"
++#ifdef USE_SAMPLE_PAIRING_DATA
+ #include "sample_pairing_data.h"
++#endif
+ #include "sensor_public_keys.h"
+ #include "synatlsmoc.h"
+ #include "tagval.h"
+@@ -52,12 +59,6 @@
+  * initialized in Windows */
+ /* WARN: current implementation starts a new TLS session on each device open */
+ 
+-#define DEBUG
+-
+-/* Needed for testing with libfprint examples they do not support storage of
+- * pairing data */
+-// #define USE_SAMPLE_PAIRING_DATA
+-
+ guint8 cache_tuid[] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+ 
+@@ -71,6 +72,11 @@ typedef struct CmdData
+   CmdCallback callback;
+ } CmdData;
+ 
++typedef struct CancelCleanupData
++{
++  GError *action_error;
++} CancelCleanupData;
++
+ struct _FpiDeviceSynaTlsMoc
+ {
+   FpDevice parent;
+@@ -90,6 +96,12 @@ struct _FpiDeviceSynaTlsMoc
+   /* NOTE: host/this driver is the client, sensor is server */
+   TlsSession *session;
+   gboolean server_established;
++  gboolean cleanup_active;
++  gboolean frame_active;
++  gboolean enroll_active;
++  guint led_sequence_index;
++  guint led_sequence_length;
++  KensingtonLedEvent led_sequence_event;
+ 
+   guint16 event_seq_num;
+   guint32 event_mask;
+@@ -97,12 +109,21 @@ struct _FpiDeviceSynaTlsMoc
+   guint num_pending_events;
+   gboolean event_read_in_legacy_mode;
+ 
++  SynaTlsMocTransport transport;
++  guint8 usb_interface;
++
+   /* quirks */
+   gboolean disable_image_metrics;
+ };
+ 
+ G_DEFINE_TYPE (FpiDeviceSynaTlsMoc, fpi_device_synatlsmoc, FP_TYPE_DEVICE);
+ 
++static void synatlsmoc_start_cancel_cleanup (FpiDeviceSynaTlsMoc *self,
++                                             GError              *action_error);
++static void synatlsmoc_start_led_sequence (FpiDeviceSynaTlsMoc *self,
++                                           KensingtonLedEvent   event,
++                                           guint                frame_count);
++
+ // clang-format off
+ static const FpIdEntry id_table[] = {
+     /* the sensors commented out are untested, but should be suported */
+@@ -114,10 +135,18 @@ static const FpIdEntry id_table[] = {
+     // { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x0124, },
+     // { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x0169, },
+     { .vid = SYNAPTICS_VENDOR_ID, .pid = 0x016C, },
++    { .vid = KENSINGTON_VENDOR_ID, .pid = 0x00F2,
++      .driver_data = SYNATLSMOC_DRIVER_KENSINGTON_EP0, },
+     { .vid = 0, .pid = 0, .driver_data = 0 }, /* terminating entry */
+ };
+ // clang-format on
+ 
++static gboolean
++synatlsmoc_uses_kensington_transport (FpiDeviceSynaTlsMoc *self)
++{
++  return self->transport == SYNATLSMOC_TRANSPORT_KENSINGTON_EP0;
++}
++
+ static gboolean
+ synatlsmoc_is_in_bootloader_mode (FpiDeviceSynaTlsMoc *self)
+ {
+@@ -338,17 +367,8 @@ sensor_certificate_from_raw (Certificate *self, guint8 *data, gsize len, GError
+       return FALSE;
+     }
+ 
+-  g_autofree gchar *x_str = bin2hex (self->x, ECC_KEY_SIZE);
+-  g_autofree gchar *y_str = bin2hex (self->y, ECC_KEY_SIZE);
+-  g_autofree gchar *sign_str = bin2hex (self->sign, self->sign_size);
+-  fp_dbg ("Certificate:");
+-  fp_dbg ("\tmagic: 0x%04x", self->magic);
+-  fp_dbg ("\tcurve: 0x%04x", self->curve);
+-  fp_dbg ("\tpub_x: %s", x_str);
+-  fp_dbg ("\tpub_y: %s", y_str);
+-  fp_dbg ("\tcert_type: 0x%02x", self->cert_type);
+-  fp_dbg ("\tsign_size: 0x%04x", self->sign_size);
+-  fp_dbg ("\tsignature: %s", sign_str);
++  fp_dbg ("Parsed certificate type 0x%02x with %u-byte signature",
++          self->cert_type, self->sign_size);
+ 
+   return TRUE;
+ }
+@@ -395,6 +415,16 @@ synatlsmoc_ssm_next_state_cb (FpDevice *device, guchar *buffer_in, gsize length_
+     fpi_ssm_next_state (self->task_ssm);
+ }
+ 
++static void
++synatlsmoc_advance_with_result_led (FpiDeviceSynaTlsMoc *self,
++                                    gboolean             matched)
++{
++  if (synatlsmoc_uses_kensington_transport (self) && !matched)
++    synatlsmoc_start_led_sequence (self, KENSINGTON_LED_EVENT_REJECTED, 1);
++  else
++    fpi_ssm_next_state (self->task_ssm);
++}
++
+ static void
+ synatlsmoc_task_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
+ {
+@@ -404,9 +434,29 @@ synatlsmoc_task_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
+   /* task_ssm is going to be freed by completion of SSM */
+   g_assert (!self->task_ssm || self->task_ssm == ssm);
+   self->task_ssm = NULL;
++  self->led_sequence_index = 0;
++  self->led_sequence_length = 0;
+ 
+   if (error)
+-    fpi_device_action_error (device, error);
++    {
++      FpiDeviceAction action = fpi_device_get_current_action (device);
++      gboolean action_needs_cleanup =
++          action == FPI_DEVICE_ACTION_ENROLL ||
++          action == FPI_DEVICE_ACTION_VERIFY ||
++          action == FPI_DEVICE_ACTION_IDENTIFY;
++      gboolean device_removed =
++          g_error_matches (error, G_USB_DEVICE_ERROR,
++                           G_USB_DEVICE_ERROR_NO_DEVICE);
++
++      if (!self->cleanup_active && self->session && action_needs_cleanup &&
++          !device_removed)
++        {
++          synatlsmoc_start_cancel_cleanup (self, error);
++          return;
++        }
++
++      fpi_device_action_error (device, error);
++    }
+ }
+ 
+ static gboolean
+@@ -448,12 +498,6 @@ synatlsmoc_cmd_receive_cb (FpiUsbTransfer *transfer,
+ 
+   if (self->session && !data->raw)
+     {
+-#ifdef DEBUG
+-      g_autofree char *recv_wrapped_str =
+-          bin2hex (transfer->buffer, transfer->actual_length);
+-      fp_dbg ("\twresp: %s", recv_wrapped_str);
+-#endif
+-
+       tls_session_unwrap (self->session, transfer->buffer, transfer->actual_length,
+                           &unwrapped, &unwrapped_len, &local_error);
+       if (local_error)
+@@ -468,11 +512,6 @@ synatlsmoc_cmd_receive_cb (FpiUsbTransfer *transfer,
+       unwrapped_len = transfer->actual_length;
+     }
+ 
+-#ifdef DEBUG
+-  g_autofree char *recv_str = bin2hex (unwrapped, unwrapped_len);
+-  fp_dbg ("\trecv: %s", recv_str);
+-#endif
+-
+   if (!data->raw)
+     {
+       if (unwrapped_len < SENSOR_FW_REPLY_STATUS_HEADER_LEN)
+@@ -531,11 +570,34 @@ synatlsmoc_cmd_run_state (FpiSsm *ssm, FpDevice *device)
+       transfer = fpi_usb_transfer_new (device);
+       transfer->ssm = ssm;
+       transfer->short_is_error = FALSE;
+-      fpi_usb_transfer_fill_bulk (transfer, SYNATLSMOC_EP_RESP_IN,
+-                                  data->length_in);
++
++      if (self->transport == SYNATLSMOC_TRANSPORT_KENSINGTON_EP0)
++        {
++          KensingtonControlPlan plan;
++          g_autoptr (GError) error = NULL;
++
++          if (!kensington_transport_prepare_response (data->length_in, &plan,
++                                                      &error))
++            {
++              fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
++              break;
++            }
++
++          fpi_usb_transfer_fill_control (
++              transfer, G_USB_DEVICE_DIRECTION_DEVICE_TO_HOST,
++              G_USB_DEVICE_REQUEST_TYPE_VENDOR, G_USB_DEVICE_RECIPIENT_DEVICE,
++              plan.request, plan.value, plan.index, plan.wire_length);
++        }
++      else
++        {
++          fpi_usb_transfer_fill_bulk (transfer, SYNATLSMOC_EP_RESP_IN,
++                                      data->length_in);
++        }
++
+       fpi_usb_transfer_submit (
+           g_steal_pointer (&transfer), SYNATLSMOC_USB_RECV_TIMEOUT,
+-          fpi_device_get_cancellable (device), synatlsmoc_cmd_receive_cb, data);
++          self->cleanup_active ? NULL : fpi_device_get_cancellable (device),
++          synatlsmoc_cmd_receive_cb, data);
+       break;
+     }
+ }
+@@ -568,16 +630,8 @@ synatlsmoc_exec_cmd (FpiDeviceSynaTlsMoc *self, gboolean raw, gboolean check_res
+   GError *local_error = NULL;
+   guint8 *wrapped;
+   gsize wrapped_len;
+-#ifdef DEBUG
+-  g_autofree char *wrapped_str = NULL;
+-  g_autofree char *cmd_str = bin2hex (cmd, cmd_size);
+-#endif
+-
+   g_assert (cmd);
+   fp_dbg ("CMD  -> 0x%02x - %s", cmd[0], cmd_to_str (cmd[0]));
+-#ifdef DEBUG
+-  fp_dbg ("\traw req: %s", cmd_str);
+-#endif
+ 
+   g_assert (self->cmd_ssm == NULL);
+   self->cmd_ssm = fpi_ssm_new_full (device, synatlsmoc_cmd_run_state, CMD_STATES,
+@@ -605,10 +659,6 @@ synatlsmoc_exec_cmd (FpiDeviceSynaTlsMoc *self, gboolean raw, gboolean check_res
+ 
+       data->length_in = resp_size + WRAP_RESPONSE_ADDITIONAL_SIZE;
+ 
+-#ifdef DEBUG
+-      wrapped_str = bin2hex (wrapped, wrapped_len);
+-      fp_dbg ("\traw wreq: %s", wrapped_str);
+-#endif
+     }
+   else
+     {
+@@ -621,14 +671,94 @@ synatlsmoc_exec_cmd (FpiDeviceSynaTlsMoc *self, gboolean raw, gboolean check_res
+   transfer->short_is_error = TRUE;
+   transfer->ssm = self->cmd_ssm;
+ 
+-  fpi_usb_transfer_fill_bulk_full (transfer, SYNATLSMOC_EP_CMD_OUT, wrapped,
+-                                   wrapped_len, g_free);
++  if (self->transport == SYNATLSMOC_TRANSPORT_KENSINGTON_EP0)
++    {
++      g_autofree guint8 *wire = NULL;
++      KensingtonControlPlan plan;
++
++      if (!kensington_transport_prepare_command (wrapped, wrapped_len, &wire,
++                                                 &plan, &local_error))
++        {
++          g_free (wrapped);
++          fpi_usb_transfer_unref (transfer);
++          fpi_ssm_start (self->cmd_ssm, synatlsmoc_cmd_ssm_done);
++          fpi_ssm_mark_failed (self->cmd_ssm, local_error);
++          return;
++        }
++
++      fpi_usb_transfer_fill_control (
++          transfer, G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
++          G_USB_DEVICE_REQUEST_TYPE_VENDOR, G_USB_DEVICE_RECIPIENT_DEVICE,
++          plan.request, plan.value, plan.index, plan.wire_length);
++      memcpy (transfer->buffer, wire, plan.wire_length);
++      g_free (wrapped);
++    }
++  else
++    {
++      fpi_usb_transfer_fill_bulk_full (transfer, SYNATLSMOC_EP_CMD_OUT, wrapped,
++                                       wrapped_len, g_free);
++    }
+ 
+   g_assert (self->cmd_transfer == NULL);
+   self->cmd_transfer = transfer;
+   fpi_ssm_start (self->cmd_ssm, synatlsmoc_cmd_ssm_done);
+ }
+ 
++static void
++synatlsmoc_send_next_led_frame (FpiDeviceSynaTlsMoc *self);
++
++static void
++recv_kensington_led_frame (FpDevice *device,
++                           guint8   *buffer_in,
++                           gsize     length_in,
++                           GError   *error)
++{
++  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (self->task_ssm, error);
++      return;
++    }
++
++  self->led_sequence_index++;
++  if (self->led_sequence_index < self->led_sequence_length)
++    synatlsmoc_send_next_led_frame (self);
++  else
++    {
++      self->led_sequence_index = 0;
++      self->led_sequence_length = 0;
++      fpi_ssm_next_state (self->task_ssm);
++    }
++}
++
++static void
++synatlsmoc_send_next_led_frame (FpiDeviceSynaTlsMoc *self)
++{
++  guint8 command[KENSINGTON_LED_EX2_COMMAND_SIZE];
++
++  g_assert (self->led_sequence_index < self->led_sequence_length);
++  kensington_transport_build_led_ex2 (command, self->led_sequence_event);
++  synatlsmoc_exec_cmd (self, FALSE, TRUE, command, sizeof (command),
++                       SENSOR_FW_REPLY_STATUS_HEADER_LEN,
++                       recv_kensington_led_frame);
++}
++
++static void
++synatlsmoc_start_led_sequence (FpiDeviceSynaTlsMoc *self,
++                               KensingtonLedEvent   event,
++                               guint                frame_count)
++{
++  g_assert (synatlsmoc_uses_kensington_transport (self));
++  g_assert (frame_count > 0);
++  g_assert (self->led_sequence_length == 0);
++
++  self->led_sequence_index = 0;
++  self->led_sequence_length = frame_count;
++  self->led_sequence_event = event;
++  synatlsmoc_send_next_led_frame (self);
++}
++
+ static void
+ synatlsmoc_set_print_data (FpPrint *print, Db2Id template_id, FpUserId fp_user_id, FingerId finger_id)
+ {
+@@ -640,7 +770,7 @@ synatlsmoc_set_print_data (FpPrint *print, Db2Id template_id, FpUserId fp_user_i
+ 
+   g_object_set (print, "description", user_id_safe, NULL);
+ 
+-  GVariant *uid = g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, user_id_safe,
++  GVariant *uid = g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, fp_user_id,
+                                              sizeof (FpUserId), 1);
+   GVariant *tid = g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, template_id,
+                                              sizeof (Db2Id), 1);
+@@ -701,9 +831,6 @@ fp_dbg_mis_version (MisVersion *mis_version)
+   g_autoptr (GDateTime) build_datetime =
+       g_date_time_new_from_unix_utc (mis_version->build_time);
+   g_autofree gchar *build_time_str = g_date_time_format_iso8601 (build_datetime);
+-  g_autofree gchar *serial_number_str =
+-      bin2hex (mis_version->serial_number, sizeof (mis_version->serial_number));
+-
+   fp_dbg ("Mis version data:");
+   fp_dbg ("\tBuild Time: %s", build_time_str);
+   fp_dbg ("\tBuild Num: %d", mis_version->build_num);
+@@ -715,7 +842,7 @@ fp_dbg_mis_version (MisVersion *mis_version)
+   fp_dbg ("\tFormal release: %d", mis_version->formal_release);
+   fp_dbg ("\tPlatform: %d", mis_version->platform);
+   fp_dbg ("\tPatch: %d", mis_version->patch);
+-  fp_dbg ("\tSerial number: %s", serial_number_str);
++  fp_dbg ("\tSerial number: [redacted]");
+   fp_dbg ("\tSecurity: 0x%x", mis_version->security);
+   fp_dbg ("\tInterface: 0x%x", mis_version->interface);
+   fp_dbg ("\tDevice type: 0x%x", mis_version->device_type);
+@@ -737,7 +864,7 @@ recv_get_version (FpDevice *device, guchar *buffer_in, gsize length_in, GError *
+   FpiByteReader reader;
+   gboolean read_ok = TRUE;
+ 
+-  MisVersion mis_version;
++  MisVersion mis_version = { 0 };
+ 
+   fpi_byte_reader_init (&reader, buffer_in, length_in);
+   /* no need to read status again */
+@@ -922,6 +1049,7 @@ recv_frame_acquire (FpDevice *device, guint8 *buffer_in, gsize length_in, GError
+   guint16 status = FP_READ_UINT16_LE (buffer_in);
+   if (status_is_success (status))
+     {
++      self->frame_active = TRUE;
+       fpi_ssm_next_state (self->task_ssm);
+     }
+   else if (status == RESPONSE_PROCESSING_FRAME)
+@@ -932,7 +1060,10 @@ recv_frame_acquire (FpDevice *device, guint8 *buffer_in, gsize length_in, GError
+           EnrollData *enroll_ssm_data = fpi_ssm_get_data (self->task_ssm);
+           retry_idx = &enroll_ssm_data->frame_acquire_retry_idx;
+         }
+-      else if (fpi_device_get_current_action (device) == FPI_DEVICE_ACTION_VERIFY)
++      else if (fpi_device_get_current_action (device) ==
++                   FPI_DEVICE_ACTION_VERIFY ||
++               fpi_device_get_current_action (device) ==
++                   FPI_DEVICE_ACTION_IDENTIFY)
+         {
+           IdentifyVerifyData *identify_verify_ssm_data =
+               fpi_ssm_get_data (self->task_ssm);
+@@ -943,12 +1074,18 @@ recv_frame_acquire (FpDevice *device, guint8 *buffer_in, gsize length_in, GError
+           g_assert_not_reached ();
+         }
+ 
+-      if (retry_idx > 0)
++      if (*retry_idx > 0)
+         {
+           *retry_idx -= 1;
+           fp_dbg ("Received processing frame; current / max retries: %d/%d ....",
+                   *retry_idx, FRAME_ACQUIRE_NUM_RETRIES);
+-          fpi_ssm_jump_to_state (self->task_ssm, ENROLL_SEND_FRAME_ACQUIRE);
++          if (fpi_device_get_current_action (device) ==
++              FPI_DEVICE_ACTION_ENROLL)
++            fpi_ssm_jump_to_state (self->task_ssm,
++                                   ENROLL_SEND_FRAME_ACQUIRE);
++          else
++            fpi_ssm_jump_to_state (self->task_ssm,
++                                   IDENTIFY_VERIFY_SEND_FRAME_ACQUIRE);
+         }
+       else
+         {
+@@ -1004,12 +1141,31 @@ send_frame_acquire (FpiDeviceSynaTlsMoc *self, guint8 capture_flags)
+ 
+   /* Do not check the response status as there is a status on which we
+    * should send the command again */
++  self->frame_active = TRUE;
+   synatlsmoc_exec_cmd (self, FALSE, TRUE, cmd, send_size, expected_recv_size,
+                        recv_frame_acquire);
+ }
+ 
+ /* VCSFW_CMD_FRAME_FINISH ================================================== */
+ 
++static void
++recv_frame_finish (FpDevice *device,
++                   guint8   *buffer_in,
++                   gsize     length_in,
++                   GError   *error)
++{
++  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (self->task_ssm, error);
++      return;
++    }
++
++  self->frame_active = FALSE;
++  fpi_ssm_next_state (self->task_ssm);
++}
++
+ static void
+ sensor_frame_finish (FpiDeviceSynaTlsMoc *self)
+ {
+@@ -1021,7 +1177,7 @@ sensor_frame_finish (FpiDeviceSynaTlsMoc *self)
+   cmd[0] = VCSFW_CMD_FRAME_FINISH;
+ 
+   synatlsmoc_exec_cmd (self, FALSE, TRUE, cmd, send_size, expected_recv_size,
+-                       synatlsmoc_ssm_next_state_cb);
++                       recv_frame_finish);
+ }
+ 
+ /* VCSFW_CMD_EVENT_CONFIG ================================================== */
+@@ -1073,9 +1229,18 @@ send_event_config (FpiDeviceSynaTlsMoc *self, guint32 mask)
+ 
+   fpi_byte_writer_init_with_size (&writer, send_size, TRUE);
+   written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_EVENT_CONFIG);
+-  for (gint i = 0; i < event_mask_cnt && written; ++i)
++  if (synatlsmoc_uses_kensington_transport (self))
+     {
+-      written &= fpi_byte_writer_put_uint32_le (&writer, mask);
++      guint8 event_masks[KENSINGTON_EVENT_MASK_BYTES];
++
++      kensington_transport_encode_event_mask (event_masks, mask);
++      written &= fpi_byte_writer_put_data (&writer, event_masks,
++                                           sizeof (event_masks));
++    }
++  else
++    {
++      for (gint i = 0; i < event_mask_cnt && written; ++i)
++        written &= fpi_byte_writer_put_uint32_le (&writer, mask);
+     }
+   fpi_byte_writer_put_uint32_le (&writer, mask != 0 ? 0 : 4);
+ 
+@@ -1363,6 +1528,7 @@ recv_enroll_start (FpDevice *device, guint8 *buffer_in, gsize length_in, GError
+   // NOTE: nonce buffer is not used
+   fp_dbg ("Received nonce buffer with size: %d", nonce_size);
+ 
++  self->enroll_active = TRUE;
+   fpi_ssm_next_state (self->task_ssm);
+ }
+ 
+@@ -1390,24 +1556,11 @@ send_enroll_start (FpiDeviceSynaTlsMoc *self)
+ 
+   g_autofree guint8 *cmd = fpi_byte_writer_reset_and_get_data (&writer);
+ 
++  self->enroll_active = TRUE;
+   synatlsmoc_exec_cmd (self, FALSE, TRUE, cmd, send_size, expected_recv_size,
+                        recv_enroll_start);
+ }
+ 
+-static void
+-fp_dbg_enroll_stats (EnrollStats *enroll_stats)
+-{
+-  fp_dbg ("Enroll stats:");
+-  fp_dbg ("\tprogress: %d", enroll_stats->progress);
+-  fp_dbg ("\tquality: %d", enroll_stats->quality);
+-  fp_dbg ("\tredundant: %d", enroll_stats->redundant);
+-  fp_dbg ("\trejected: %d", enroll_stats->rejected);
+-  fp_dbg ("\ttemplate count: %d", enroll_stats->template_cnt);
+-  fp_dbg ("\tenroll quality: %d", enroll_stats->enroll_quality);
+-  fp_dbg ("\tenroll status: %d", enroll_stats->status);
+-  fp_dbg ("\t(smt like) has fixed pattern: %d", enroll_stats->has_fixed_pattern);
+-}
+-
+ static gboolean
+ fpi_byte_reader_get_enroll_stats (FpiByteReader *reader,
+                                   EnrollStats *enroll_stats)
+@@ -1486,9 +1639,7 @@ recv_add_image (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *er
+   read_ok &= fpi_byte_reader_get_enroll_stats (&reader, &enroll_stats);
+   FAIL_TASK_SSM_AND_RETURN_IF_NOT_READ (read_ok);
+ 
+-  fp_dbg_enroll_stats (&enroll_stats);
+-  g_autofree gchar *template_id_str = bin2hex (template_id_offset, DB2_ID_SIZE);
+-  fp_dbg ("\ttemplate id: %s", template_id_str);
++  fp_dbg ("Enrollment sample progress: %u percent", enroll_stats.progress);
+ 
+   GError *retry = NULL;
+ 
+@@ -1508,7 +1659,7 @@ recv_add_image (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *er
+         }
+       else
+         {
+-          fp_info ("Image rejected due to bad quality: %d", enroll_stats.quality);
++          fp_info ("Image rejected due to bad quality");
+           retry = fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL,
+                                             "Scan has bad quality");
+         }
+@@ -1518,8 +1669,7 @@ recv_add_image (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *er
+ 
+   if (enroll_stats.progress == 100)
+     {
+-      fp_dbg ("Enrollment completed successfully with quality %d",
+-              enroll_stats.quality);
++      fp_dbg ("Enrollment completed successfully");
+ 
+       memcpy (data->template_id, template_id_offset, DB2_ID_SIZE);
+ 
+@@ -1585,6 +1735,24 @@ send_enroll_commit (FpiDeviceSynaTlsMoc *self,
+                        synatlsmoc_ssm_next_state_cb);
+ }
+ 
++static void
++recv_enroll_finish (FpDevice *device,
++                    guint8   *buffer_in,
++                    gsize     length_in,
++                    GError   *error)
++{
++  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (self->task_ssm, error);
++      return;
++    }
++
++  self->enroll_active = FALSE;
++  fpi_ssm_next_state (self->task_ssm);
++}
++
+ static void
+ send_enroll_finish (FpiDeviceSynaTlsMoc *self)
+ {
+@@ -1605,7 +1773,83 @@ send_enroll_finish (FpiDeviceSynaTlsMoc *self)
+   g_autofree guint8 *cmd = fpi_byte_writer_reset_and_get_data (&writer);
+ 
+   synatlsmoc_exec_cmd (self, FALSE, TRUE, cmd, send_size, expected_recv_size,
+-                       synatlsmoc_ssm_next_state_cb);
++                       recv_enroll_finish);
++}
++
++static void
++cancel_cleanup_data_free (CancelCleanupData *data)
++{
++  g_clear_error (&data->action_error);
++  g_free (data);
++}
++
++static void
++synatlsmoc_cancel_cleanup_run_state (FpiSsm  *ssm,
++                                     FpDevice *device)
++{
++  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case CANCEL_CLEANUP_EVENT_MASK_NONE:
++      send_event_config (self, NO_EVENTS);
++      break;
++    case CANCEL_CLEANUP_FRAME_FINISH:
++      if (self->frame_active)
++        sensor_frame_finish (self);
++      else
++        fpi_ssm_next_state (ssm);
++      break;
++    case CANCEL_CLEANUP_ENROLL_FINISH:
++      if (self->enroll_active)
++        send_enroll_finish (self);
++      else
++        fpi_ssm_next_state (ssm);
++      break;
++    case CANCEL_CLEANUP_COMPLETE:
++      fpi_ssm_mark_completed (ssm);
++      break;
++    }
++}
++
++static void
++synatlsmoc_cancel_cleanup_done (FpiSsm  *ssm,
++                                FpDevice *device,
++                                GError   *error)
++{
++  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
++  CancelCleanupData *data = fpi_ssm_get_data (ssm);
++  g_autoptr (GError) cleanup_error = error;
++  g_autoptr (GError) action_error = g_steal_pointer (&data->action_error);
++
++  g_assert (self->task_ssm == ssm);
++  self->task_ssm = NULL;
++  self->cleanup_active = FALSE;
++  self->frame_active = FALSE;
++  self->enroll_active = FALSE;
++
++  if (cleanup_error)
++    fp_warn ("Sensor cleanup after action failure did not complete: %s",
++             cleanup_error->message);
++
++  fpi_device_action_error (device, g_steal_pointer (&action_error));
++}
++
++static void
++synatlsmoc_start_cancel_cleanup (FpiDeviceSynaTlsMoc *self,
++                                 GError              *action_error)
++{
++  CancelCleanupData *data = g_new0 (CancelCleanupData, 1);
++
++  data->action_error = action_error;
++  self->cleanup_active = TRUE;
++  self->task_ssm = fpi_ssm_new_full (
++      FP_DEVICE (self), synatlsmoc_cancel_cleanup_run_state,
++      CANCEL_CLEANUP_NUM_STATES, CANCEL_CLEANUP_NUM_STATES,
++      "Cancel cleanup");
++  fpi_ssm_set_data (self->task_ssm, data,
++                    (GDestroyNotify) cancel_cleanup_data_free);
++  fpi_ssm_start (self->task_ssm, synatlsmoc_cancel_cleanup_done);
+ }
+ 
+ /* VCSFW_CMD_IDENTIFY_MATCH ================================================ */
+@@ -1650,7 +1894,7 @@ recv_identify_match (FpDevice *device, guint8 *buffer_in, gsize length_in, GErro
+           fpi_device_verify_report (device, FPI_MATCH_FAIL, NULL, NULL);
+         }
+ 
+-      fpi_ssm_next_state (self->task_ssm);
++      synatlsmoc_advance_with_result_led (self, FALSE);
+       return;
+     }
+ 
+@@ -1734,7 +1978,7 @@ recv_identify_match (FpDevice *device, guint8 *buffer_in, gsize length_in, GErro
+   FpPrint *print = fp_print_new (device);
+   synatlsmoc_set_print_data (print, template_id, (char *) user_id, *finger_id);
+ 
+-  fp_info ("Identify successful for: %s", fp_print_get_description (print));
++  fp_info ("Identify successful");
+ 
+   if (fpi_device_get_current_action (device) == FPI_DEVICE_ACTION_IDENTIFY)
+     {
+@@ -1751,20 +1995,24 @@ recv_identify_match (FpDevice *device, guint8 *buffer_in, gsize length_in, GErro
+                                     print, NULL);
+       else
+         fpi_device_identify_report (device, NULL, print, NULL);
++
++      synatlsmoc_advance_with_result_led (self, found);
+     }
+   else
+     {
+       FpPrint *verify_print = NULL;
++      gboolean matched;
+       fpi_device_get_verify_data (device, &verify_print);
+-      fp_info ("Verifying against: %s", fp_print_get_description (verify_print));
++      fp_info ("Comparing identify result with requested print");
+ 
+-      if (fp_print_equal (verify_print, print))
++      matched = fp_print_equal (verify_print, print);
++      if (matched)
+         fpi_device_verify_report (device, FPI_MATCH_SUCCESS, print, NULL);
+       else
+         fpi_device_verify_report (device, FPI_MATCH_FAIL, print, NULL);
+-    }
+ 
+-  fpi_ssm_next_state (self->task_ssm);
++      synatlsmoc_advance_with_result_led (self, matched);
++    }
+ }
+ 
+ static void
+@@ -1887,7 +2135,7 @@ recv_get_image_metrics (FpDevice *device, guint8 *buffer_in, gsize length_in, GE
+           read_ok &= fpi_byte_reader_get_uint32_le (&reader, &ipl_coverage);
+           FAIL_TASK_SSM_AND_RETURN_IF_NOT_READ (read_ok);
+ 
+-          fp_dbg ("IPL finger coverage: %u", ipl_coverage);
++          (void) ipl_coverage;
+           break;
+         case MIS_IMAGE_METRICS_IMG_QUALITY:
+           g_assert (image_metrics_length == 8);
+@@ -1898,8 +2146,7 @@ recv_get_image_metrics (FpDevice *device, guint8 *buffer_in, gsize length_in, GE
+               fpi_byte_reader_get_uint32_le (&reader, &matcher_sensor_coverage);
+           FAIL_TASK_SSM_AND_RETURN_IF_NOT_READ (read_ok);
+ 
+-          fp_dbg ("Matcher image quality: %d%%", matcher_img_quality);
+-          fp_dbg ("Matcher sensor coverage: %d%%", matcher_sensor_coverage);
++          (void) matcher_sensor_coverage;
+ 
+           if (matcher_img_quality < IMAGE_QUALITY_THRESHOLD)
+             {
+@@ -1907,8 +2154,7 @@ recv_get_image_metrics (FpDevice *device, guint8 *buffer_in, gsize length_in, GE
+                   self->task_ssm,
+                   set_and_report_error (
+                       FP_DEVICE_ERROR_GENERAL,
+-                      "Image quality %d%% is lower than threshold %d%%",
+-                      matcher_img_quality, IMAGE_QUALITY_THRESHOLD));
++                      "Image quality is lower than the acceptance threshold"));
+               return;
+             }
+ 
+@@ -2072,6 +2318,7 @@ recv_db2_get_db2_info (FpDevice *device, guint8 *buffer_in, gsize length_in, GEr
+   data->num_current_payloads = db2_info.num_current_payloads;
+ 
+   data->cleanup_required =
++      !synatlsmoc_uses_kensington_transport (self) &&
+       db2_info.num_deleted_users != 0 && db2_info.num_available_user_slots == 0;
+ 
+   fpi_ssm_next_state (self->task_ssm);
+@@ -2154,8 +2401,7 @@ recv_db2_get_template_list (FpDevice *device, guint8 *buffer_in, gsize length_in
+       fpi_byte_reader_dup_data (&reader, DB2_ID_SIZE, &template_id);
+ 
+       FAIL_TASK_SSM_AND_RETURN_IF_NOT_READ (read_ok);
+-      g_autofree gchar *template_str = bin2hex (template_id, DB2_ID_SIZE);
+-      fp_dbg ("\tat idx %d is: %s", i, template_str);
++      fp_dbg ("Received template reference at index %d", i);
+ 
+       g_ptr_array_add (data->list_template_id, g_steal_pointer (&template_id));
+     }
+@@ -2203,17 +2449,14 @@ recv_db2_get_payload_list (FpDevice *device, guint8 *buffer_in, gsize length_in,
+       fpi_byte_reader_dup_data (&reader, DB2_ID_SIZE, &payload);
+ 
+       FAIL_TASK_SSM_AND_RETURN_IF_NOT_READ (read_ok);
+-      g_autofree gchar *payload_str = bin2hex (payload, DB2_ID_SIZE);
+-      fp_dbg ("\tat idx %d is: %s", i, payload_str);
++      fp_dbg ("Received payload reference at index %d", i);
+ 
+       g_ptr_array_add (data->list_payload_id, g_steal_pointer (&payload));
+     }
+ 
+   if (data->list_payload_id->len == 0)
+     {
+-      g_autofree gchar *tuid_str =
+-          bin2hex ((guint8 *) data->current_template_id, DB2_ID_SIZE);
+-      fp_dbg ("No payload data for an enrollment with tuid: %s", tuid_str);
++      fp_dbg ("No payload data for the current enrollment reference");
+ 
+       if (data->list_template_id->len > 0)
+         fpi_ssm_jump_to_state (self->task_ssm, LIST_DB2_GET_PAYLOAD_LIST);
+@@ -2236,9 +2479,7 @@ send_db2_get_object_list (FpiDeviceSynaTlsMoc *self,
+   const guint send_size = 21;
+   const guint expected_recv_size = get_object_list_recv_size (self, obj_type);
+ 
+-  g_autofree char *obj_id_str = bin2hex (obj_id, DB2_ID_SIZE);
+-  fp_dbg ("Getting object list of type %s for id: %s", obj_type_to_str (obj_type),
+-          obj_id_str);
++  fp_dbg ("Getting object list of type %s", obj_type_to_str (obj_type));
+ 
+   FpiByteWriter writer;
+   gboolean written = TRUE;
+@@ -2310,16 +2551,7 @@ recv_db2_get_payload_info (FpDevice *device, guint8 *buffer_in, gsize length_in,
+       return;
+     }
+ 
+-  g_autofree gchar *info_0_1_str = bin2hex (info_0_1, 2);
+-  g_autofree gchar *info_2_17_str = bin2hex (info_2_17, 16);
+-  g_autofree gchar *info_18_33_str = bin2hex (info_18_33, 16);
+-  g_autofree gchar *info_34_45_str = bin2hex (info_34_45, 12);
+-  fp_dbg ("DB2 payload info:");
+-  fp_dbg ("\t0-1: %s", info_0_1_str);
+-  fp_dbg ("\t2-17: %s", info_2_17_str);
+-  fp_dbg ("\t18-33: %s", info_18_33_str);
+-  fp_dbg ("\t34-45: %s", info_34_45_str);
+-  fp_dbg ("\t46-49 size of payload data: %d", payload_size);
++  fp_dbg ("Received DB2 payload metadata (%u-byte payload)", payload_size);
+ 
+   data->current_payload_size = payload_size;
+ 
+@@ -2367,16 +2599,7 @@ recv_db2_get_template_info (FpDevice *device, guint8 *buffer_in, gsize length_in
+       return;
+     }
+ 
+-  g_autofree gchar *info_0_1_str = bin2hex (info_0_1, 2);
+-  g_autofree gchar *user_id_str = bin2hex (data->user_id, DB2_ID_SIZE);
+-  g_autofree gchar *info_18_33_str = bin2hex (info_18_33, 16);
+-  g_autofree gchar *info_34_45_str = bin2hex (info_34_45, 12);
+-  fp_dbg ("DB2 payload info:");
+-  fp_dbg ("\t0-1: %s", info_0_1_str);
+-  fp_dbg ("\t2-17 user_id: %s", user_id_str);
+-  fp_dbg ("\t18-33: %s", info_18_33_str);
+-  fp_dbg ("\t34-45: %s", info_34_45_str);
+-  fp_dbg ("\t46-49: %d", some_size);
++  fp_dbg ("Received DB2 template metadata (%u-byte object)", some_size);
+ 
+   fpi_ssm_next_state (self->task_ssm);
+ }
+@@ -2389,9 +2612,7 @@ send_db2_get_object_info (FpiDeviceSynaTlsMoc *self,
+   const guint send_size = 21;
+   const guint expected_recv_size = obj_type == OBJ_TYPE_USERS ? 12 : 52;
+ 
+-  g_autofree gchar *obj_id_str = bin2hex (obj_id, DB2_ID_SIZE);
+-  fp_dbg ("Getting object info for %s with id: %s", obj_type_to_str (obj_type),
+-          obj_id_str);
++  fp_dbg ("Getting object info for %s", obj_type_to_str (obj_type));
+ 
+   FpiByteWriter writer;
+   fpi_byte_writer_init_with_size (&writer, send_size, TRUE);
+@@ -2489,17 +2710,7 @@ recv_db2_get_payload_data (FpDevice *device, guint8 *buffer_in, gsize length_in,
+   g_assert (user_id_len == sizeof (FpUserId));
+   g_assert (finger_id_len == sizeof (FingerId));
+ 
+-  g_autofree gchar *tuid_str =
+-      bin2hex ((guint8 *) data->current_template_id, DB2_ID_SIZE);
+-  g_autofree gchar *payload_id_str =
+-      bin2hex ((guint8 *) data->current_payload_id, DB2_ID_SIZE);
+-  g_autofree gchar *template_id_str =
+-      bin2hex ((guint8 *) template_id, template_id_len);
+-  fp_dbg ("Object with tuid=%s and payload_id=%s has data:", tuid_str,
+-          payload_id_str);
+-  fp_dbg ("\ttemplate_id: %s", template_id_str);
+-  fp_dbg ("\tuser_id: \"%s\"", user_id);
+-  fp_dbg ("\tfinger_id: %d", *finger_id);
++  fp_dbg ("Parsed one device-stored print reference");
+ 
+   FpPrint *print = fp_print_new (device);
+   synatlsmoc_set_print_data (print, template_id, (char *) user_id, *finger_id);
+@@ -2532,9 +2743,7 @@ send_db2_get_object_data (FpiDeviceSynaTlsMoc *self,
+       expected_recv_size = 8 + obj_data_size;
+     }
+ 
+-  g_autofree gchar *obj_id_str = bin2hex (obj_id, DB2_ID_SIZE);
+-  fp_dbg ("Getting object data for %s with id: %s", obj_type_to_str (obj_type),
+-          obj_id_str);
++  fp_dbg ("Getting object data for %s", obj_type_to_str (obj_type));
+ 
+   FpiByteWriter writer;
+   fpi_byte_writer_init_with_size (&writer, send_size, TRUE);
+@@ -2609,8 +2818,7 @@ send_db2_delete_object (FpiDeviceSynaTlsMoc *self,
+   const guint send_size = 21;
+   const guint expected_recv_size = 4;
+ 
+-  g_autofree gchar *obj_id_str = bin2hex (obj_id, DB2_ID_SIZE);
+-  fp_dbg ("Deleting %s with id: %s", obj_type_to_str (obj_type), obj_id_str);
++  fp_dbg ("Deleting one %s object", obj_type_to_str (obj_type));
+ 
+   FpiByteWriter writer;
+   fpi_byte_writer_init_with_size (&writer, send_size, TRUE);
+@@ -2825,8 +3033,7 @@ reset_usb_device_on_callback (FpiUsbTransfer *transfer,
+ static void
+ write_dft (FpiDeviceSynaTlsMoc *self, const guint8 *data, const gsize data_size, FpiUsbTransferCallback callback)
+ {
+-  g_autofree char *data_str = bin2hex (data, data_size);
+-  fp_dbg ("DFT -> %s", data_str);
++  fp_dbg ("Sending %" G_GSIZE_FORMAT " bytes of DFT data", data_size);
+ 
+   /* Send data */
+   g_autoptr (FpiUsbTransfer) transfer = fpi_usb_transfer_new (FP_DEVICE (self));
+@@ -2880,6 +3087,7 @@ send_bootloader_mode_enter_exit (FpiDeviceSynaTlsMoc *self,
+ 
+ /* end of communication function =========================================== */
+ 
++#ifdef USE_SAMPLE_PAIRING_DATA
+ static void
+ synatlsmoc_load_sample_pairing_data (FpiDeviceSynaTlsMoc *self)
+ {
+@@ -2897,14 +3105,7 @@ synatlsmoc_load_sample_pairing_data (FpiDeviceSynaTlsMoc *self)
+   privkey_pem = sample_privkey_pem;
+   privkey_pem_len = sizeof (sample_privkey_pem);
+ 
+-#ifdef DEBUG
+-  g_autofree gchar *client_cert_str = bin2hex (client_cert_raw, client_cert_len);
+-  g_autofree gchar *server_cert_str = bin2hex (server_cert_raw, server_cert_len);
+-  fp_dbg ("Loading sample pairing data:");
+-  fp_dbg ("\thost cert: %s", client_cert_str);
+-  fp_dbg ("\tsensor cert: %s", server_cert_str);
+-  fp_dbg ("\tprivate key:\n\n%.*s", (int) privkey_pem_len, privkey_pem);
+-#endif
++  fp_dbg ("Loading sample pairing data");
+ 
+   g_autoptr (OSSL_DECODER_CTX) dctx = OSSL_DECODER_CTX_new_for_pkey (
+       &self->pairing_data.client_key, "PEM", NULL, "EC",
+@@ -2949,6 +3150,7 @@ synatlsmoc_load_sample_pairing_data (FpiDeviceSynaTlsMoc *self)
+       return;
+     }
+ }
++#endif
+ 
+ static void
+ synatlsmoc_event_interrupt_cb (FpiUsbTransfer *transfer,
+@@ -3084,17 +3286,7 @@ store_pairing_data (FpiDeviceSynaTlsMoc *self)
+ 
+   g_object_set (FP_DEVICE (self), "fpi-persistent-data", pairing_data, NULL);
+ 
+-#ifdef DEBUG
+-  g_autofree char *client_cert_str =
+-      bin2hex (client_cert_raw_cpy, CERTIFICATE_SIZE);
+-  g_autofree char *server_cert_str =
+-      bin2hex (server_cert_raw_cpy, CERTIFICATE_SIZE);
+-
+-  fp_dbg ("Successfully stored pairing data:");
+-  fp_dbg ("\tClient certificate: %s", client_cert_str);
+-  fp_dbg ("\tServer certificate: %s", server_cert_str);
+-  fp_dbg ("\tPEM private key:\n%s", privkey_pem);
+-#endif
++  fp_dbg ("Successfully stored pairing data");
+ 
+   fpi_ssm_next_state (self->task_ssm);
+ }
+@@ -3104,9 +3296,7 @@ load_pairing_data (FpiDeviceSynaTlsMoc *self)
+ {
+   GError *local_error = NULL;
+ 
+-#ifdef DEBUG
+-  fp_dbg ("Loading pairing data form persistent storage:");
+-#endif
++  fp_dbg ("Loading pairing data from persistent storage");
+ 
+   g_autoptr (GVariant) pairing_data = NULL;
+   g_autoptr (GVariant) client_cert_var = NULL;
+@@ -3153,12 +3343,6 @@ load_pairing_data (FpiDeviceSynaTlsMoc *self)
+       g_memdup2 (client_cert_data, CERTIFICATE_SIZE);
+   self->pairing_data.client_cert_len = CERTIFICATE_SIZE;
+ 
+-#ifdef DEBUG
+-  g_autofree char *client_cert_str =
+-      bin2hex (self->pairing_data.client_cert_raw, CERTIFICATE_SIZE);
+-  fp_dbg ("\tClient certificate: %s", client_cert_str);
+-#endif
+-
+   gsize server_cert_data_size = 0;
+   guint8 *server_cert_data = (guint8 *) g_variant_get_fixed_array (
+       server_cert_var, &server_cert_data_size, 1);
+@@ -3176,21 +3360,11 @@ load_pairing_data (FpiDeviceSynaTlsMoc *self)
+       g_memdup2 (server_cert_data, CERTIFICATE_SIZE);
+   self->pairing_data.server_cert_len = CERTIFICATE_SIZE;
+ 
+-#ifdef DEBUG
+-  g_autofree char *server_cert_str =
+-      bin2hex (self->pairing_data.server_cert_raw, CERTIFICATE_SIZE);
+-  fp_dbg ("\tServer certificate: %s", server_cert_str);
+-#endif
+-
+   gsize privkey_pem_size = 0;
+   // fIXME: autofree
+   const gchar *privkey_pem =
+       g_variant_get_string (privkey_pem_var, &privkey_pem_size);
+ 
+-#ifdef DEBUG
+-  fp_dbg ("\tPEM private key:\n%s", privkey_pem);
+-#endif
+-
+   g_autoptr (OSSL_DECODER_CTX) dctx = OSSL_DECODER_CTX_new_for_pkey (
+       &self->pairing_data.client_key, "PEM", NULL, "EC",
+       OSSL_KEYMGMT_SELECT_KEYPAIR | OSSL_KEYMGMT_SELECT_DOMAIN_PARAMETERS, NULL,
+@@ -3263,6 +3437,44 @@ pair (FpiDeviceSynaTlsMoc *self)
+   send_pair (self, host_certificate_raw);
+ }
+ 
++static gboolean
++load_persistent_data_file (FpiDeviceSynaTlsMoc *self,
++                           const gchar         *path,
++                           GError             **error)
++{
++  g_autofree gchar *contents = NULL;
++  gsize length = 0;
++  struct stat statbuf;
++
++  if (!g_path_is_absolute (path))
++    {
++      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                           "Persistent pairing path must be absolute");
++      return FALSE;
++    }
++  if (g_lstat (path, &statbuf) != 0)
++    {
++      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
++                   "Cannot inspect persistent pairing file: %s",
++                   g_strerror (errno));
++      return FALSE;
++    }
++  if (!S_ISREG (statbuf.st_mode) || statbuf.st_uid != geteuid () ||
++      (statbuf.st_mode & 0777) != 0600)
++    {
++      g_set_error_literal (
++          error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED,
++          "Persistent pairing file must be regular, owner-only mode 0600, "
++          "and owned by the service user");
++      return FALSE;
++    }
++  if (!g_file_get_contents (path, &contents, &length, error))
++    return FALSE;
++
++  return fp_device_set_persistent_data (FP_DEVICE (self),
++                                        (guchar *) contents, length, error);
++}
++
+ static void
+ fetch_pairing_data (FpiDeviceSynaTlsMoc *self)
+ {
+@@ -3274,8 +3486,34 @@ fetch_pairing_data (FpiDeviceSynaTlsMoc *self)
+   fpi_ssm_jump_to_state (self->task_ssm, OPEN_VERIFY_SENSOR_CERTIFICATE);
+ #else
+   g_autoptr (GVariant) pairing_data = NULL;
++  const gchar *persistent_path = NULL;
+   g_object_get (FP_DEVICE (self), "fpi-persistent-data", &pairing_data, NULL);
+ 
++  persistent_path = g_getenv (SYNATLSMOC_PERSISTENT_DATA_ENV);
++  if (pairing_data == NULL && synatlsmoc_uses_kensington_transport (self) &&
++      persistent_path && persistent_path[0] != '\0')
++    {
++      g_autoptr (GError) error = NULL;
++
++      if (!load_persistent_data_file (self, persistent_path, &error))
++        {
++          fpi_ssm_mark_failed (self->task_ssm, g_steal_pointer (&error));
++          return;
++        }
++      g_object_get (FP_DEVICE (self), "fpi-persistent-data", &pairing_data,
++                    NULL);
++    }
++
++  if (pairing_data == NULL && synatlsmoc_uses_kensington_transport (self))
++    {
++      fpi_ssm_mark_failed (
++          self->task_ssm,
++          set_and_report_error (
++              FP_DEVICE_ERROR_NOT_SUPPORTED,
++              "Kensington pairing data is required; automatic pairing is disabled"));
++      return;
++    }
++
+   if ((!synatlsmoc_is_provisioned (self)) || pairing_data == NULL)
+     {
+       if (pairing_data == NULL)
+@@ -3298,10 +3536,12 @@ fetch_pairing_data (FpiDeviceSynaTlsMoc *self)
+ static void
+ synatlsmoc_open_done (FpiSsm *ssm, FpDevice *device, GError *error)
+ {
++  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
++
+   if (error)
+     {
+-      g_usb_device_release_interface (fpi_device_get_usb_device (device), 0, 0,
+-                                      NULL);
++      g_usb_device_release_interface (fpi_device_get_usb_device (device),
++                                      self->usb_interface, 0, NULL);
+       synatlsmoc_task_ssm_done (ssm, device, error);
+       return;
+     }
+@@ -3355,6 +3595,15 @@ synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *dev)
+     case OPEN_EXIT_BOOTLOADER:
+       if (synatlsmoc_is_in_bootloader_mode (self))
+         {
++          if (synatlsmoc_uses_kensington_transport (self))
++            {
++              fpi_ssm_mark_failed (
++                  ssm, set_and_report_error (
++                           FP_DEVICE_ERROR_NOT_SUPPORTED,
++                           "Kensington bootloader recovery is not supported"));
++              break;
++            }
++
+           if (open_ssm_data->tried_to_exit_bootloader_mode)
+             {
+               fpi_ssm_mark_failed (ssm, set_and_report_error (
+@@ -3452,17 +3701,33 @@ synatlsmoc_open (FpDevice *device)
+   FP_DBG_HIGHLIGHTED ("Open");
+   FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
+   GError *error = NULL;
++  guint64 driver_data = fpi_device_get_driver_data (device);
++
++  if (driver_data & SYNATLSMOC_DRIVER_KENSINGTON_EP0)
++    {
++      self->transport = SYNATLSMOC_TRANSPORT_KENSINGTON_EP0;
++      self->usb_interface = SYNATLSMOC_KENSINGTON_INTERFACE;
++      self->disable_image_metrics = TRUE;
++      fpi_device_set_nr_enroll_stages (
++          device, SYNATLSMOC_KENSINGTON_ENROLL_STAGES);
++    }
++  else
++    {
++      self->transport = SYNATLSMOC_TRANSPORT_BULK;
++      self->usb_interface = SYNATLSMOC_BULK_INTERFACE;
++    }
+ 
+   self->interrupt_cancellable = g_cancellable_new ();
+ 
+-  if (!g_usb_device_reset (fpi_device_get_usb_device (device), &error))
++  if (!synatlsmoc_uses_kensington_transport (self) &&
++      !g_usb_device_reset (fpi_device_get_usb_device (device), &error))
+     {
+       fpi_device_open_complete (device, error);
+       return;
+     }
+ 
+-  if (!g_usb_device_claim_interface (fpi_device_get_usb_device (device), 0, 0,
+-                                     &error))
++  if (!g_usb_device_claim_interface (fpi_device_get_usb_device (device),
++                                     self->usb_interface, 0, &error))
+     {
+       fpi_device_open_complete (device, error);
+       return;
+@@ -3501,6 +3766,7 @@ static void
+ synatlsmoc_close_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+ {
+   FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (dev);
++  g_autoptr (GError) release_error = NULL;
+ 
+   tls_session_free (self->session);
+   self->session = NULL;
+@@ -3508,7 +3774,10 @@ synatlsmoc_close_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+   // FIXME: causes errors
+   // free_pairing_data(&self->pairing_data);
+ 
+-  g_usb_device_release_interface (fpi_device_get_usb_device (dev), 0, 0, &error);
++  if (!g_usb_device_release_interface (fpi_device_get_usb_device (dev),
++                                       self->usb_interface, 0, &release_error) &&
++      error == NULL)
++    error = g_steal_pointer (&release_error);
+ 
+   synatlsmoc_task_ssm_done (ssm, dev, error);
+ 
+@@ -3825,7 +4094,6 @@ synatlsmoc_enroll_run_state (FpiSsm *ssm, FpDevice *device)
+     case ENROLL_ENROLL_START:
+       {
+         fp_dbg ("Starting enroll process...");
+-        fp_dbg ("\tfp_user_id: %s", data->fp_user_id);
+         fp_dbg ("\tfinger_id: %d", data->finger_id);
+ 
+         send_enroll_start (self);
+@@ -3845,12 +4113,27 @@ synatlsmoc_enroll_run_state (FpiSsm *ssm, FpDevice *device)
+       send_frame_acquire (self, CAPTURE_FLAG_ENROLL);
+       break;
+     case ENROLL_SET_EVENT_FINGER_DOWN:
+-      send_event_config (self, EV_FINGER_DOWN | EV_FRAME_READY);
++      if (synatlsmoc_uses_kensington_transport (self))
++        fpi_ssm_next_state (ssm);
++      else
++        send_event_config (self, EV_FINGER_DOWN | EV_FRAME_READY);
++      break;
++    case ENROLL_SEND_WAIT_LED:
++      if (synatlsmoc_uses_kensington_transport (self))
++        synatlsmoc_start_led_sequence (self, KENSINGTON_LED_EVENT_WAITING, 1);
++      else
++        fpi_ssm_next_state (ssm);
+       break;
+     case ENROLL_WAIT_FINGER_DOWN:
+       fpi_device_report_finger_status (device, FP_FINGER_STATUS_NEEDED);
+       synatlsmoc_wait_for_events (self);
+       break;
++    case ENROLL_SEND_LED_OFF:
++      if (synatlsmoc_uses_kensington_transport (self))
++        synatlsmoc_start_led_sequence (self, KENSINGTON_LED_EVENT_OFF, 1);
++      else
++        fpi_ssm_next_state (ssm);
++      break;
+     case ENROLL_SET_EVENT_NONE:
+       fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
+       send_event_config (self, NO_EVENTS);
+@@ -3890,8 +4173,8 @@ synatlsmoc_enroll (FpDevice *device)
+ 
+   fpi_device_get_enroll_data (device, &data->print);
+ 
+-  gchar *fp_user_id = fpi_print_generate_user_id (data->print);
+-  memcpy (data->fp_user_id, fp_user_id, sizeof (FpUserId));
++  g_autofree gchar *fp_user_id = fpi_print_generate_user_id (data->print);
++  g_strlcpy (data->fp_user_id, fp_user_id, sizeof (data->fp_user_id));
+ 
+   data->finger_id = fp_print_get_finger (data->print);
+ 
+@@ -3925,12 +4208,27 @@ synatlsmoc_identify_verify_run_state (FpiSsm *ssm, FpDevice *device)
+       send_frame_acquire (self, CAPTURE_FLAG_AUTH);
+       break;
+     case IDENTIFY_VERIFY_SET_EVENT_FINGER_DOWN:
+-      send_event_config (self, EV_FINGER_DOWN | EV_FRAME_READY);
++      if (synatlsmoc_uses_kensington_transport (self))
++        fpi_ssm_next_state (ssm);
++      else
++        send_event_config (self, EV_FINGER_DOWN | EV_FRAME_READY);
++      break;
++    case IDENTIFY_VERIFY_SEND_WAIT_LED:
++      if (synatlsmoc_uses_kensington_transport (self))
++        synatlsmoc_start_led_sequence (self, KENSINGTON_LED_EVENT_WAITING, 1);
++      else
++        fpi_ssm_next_state (ssm);
+       break;
+     case IDENTIFY_VERIFY_WAIT_FINGER_DOWN:
+       fpi_device_report_finger_status (device, FP_FINGER_STATUS_NEEDED);
+       synatlsmoc_wait_for_events (self);
+       break;
++    case IDENTIFY_VERIFY_SEND_LED_OFF:
++      if (synatlsmoc_uses_kensington_transport (self))
++        synatlsmoc_start_led_sequence (self, KENSINGTON_LED_EVENT_OFF, 1);
++      else
++        fpi_ssm_next_state (ssm);
++      break;
+     case IDENTIFY_VERIFY_SET_EVENT_NONE:
+       fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
+       send_event_config (self, NO_EVENTS);
+@@ -3963,7 +4261,10 @@ synatlsmoc_identify_verify_run_state (FpiSsm *ssm, FpDevice *device)
+               fpi_ssm_mark_failed (ssm, error);
+               break;
+             }
+-          send_identify_match (self, &verify_template_id, 1);
++          if (synatlsmoc_uses_kensington_transport (self))
++            send_identify_match (self, NULL, 0);
++          else
++            send_identify_match (self, &verify_template_id, 1);
+         }
+       break;
+     case IDENTIFY_VERIFY_COMPLETE:
+diff --git a/libfprint/libfprint/libfprint/drivers/synatlsmoc/synatlsmoc.h b/libfprint/libfprint/libfprint/drivers/synatlsmoc/synatlsmoc.h
+index 27e89f5..f79343b 100644
+--- a/libfprint/libfprint/libfprint/drivers/synatlsmoc/synatlsmoc.h
++++ b/libfprint/libfprint/libfprint/drivers/synatlsmoc/synatlsmoc.h
+@@ -34,8 +34,16 @@ G_DECLARE_FINAL_TYPE (FpiDeviceSynaTlsMoc, fpi_device_synatlsmoc, FPI, DEVICE_SY
+ 
+ #define SYNATLSMOC_DRIVER_FULLNAME "Synaptics Tudor Match-In-Sensor"
+ #define SYNATLSMOC_ENROLL_STAGES 10
++#define SYNATLSMOC_KENSINGTON_ENROLL_STAGES 7
+ 
+ #define SYNAPTICS_VENDOR_ID 0x06cb
++#define KENSINGTON_VENDOR_ID 0x047d
++
++#define SYNATLSMOC_DRIVER_KENSINGTON_EP0 (1U << 0)
++#define SYNATLSMOC_PERSISTENT_DATA_ENV "SYNA_TLSMOC_PERSISTENT_DATA_FILE"
++
++#define SYNATLSMOC_BULK_INTERFACE 0
++#define SYNATLSMOC_KENSINGTON_INTERFACE 1
+ 
+ #define SYNATLSMOC_EP_CMD_OUT (0x1 | FPI_USB_ENDPOINT_OUT)
+ #define SYNATLSMOC_EP_RESP_IN (0x1 | FPI_USB_ENDPOINT_IN)
+@@ -145,6 +153,12 @@ typedef enum
+   CMD_STATES,
+ } CommandState;
+ 
++typedef enum
++{
++  SYNATLSMOC_TRANSPORT_BULK,
++  SYNATLSMOC_TRANSPORT_KENSINGTON_EP0,
++} SynaTlsMocTransport;
++
+ enum PROVISION_STATES
+ {
+   UNPROVISIONED_A = 0,
+@@ -263,6 +277,15 @@ typedef enum
+   CLOSE_NUM_STATES,
+ } CloseState;
+ 
++typedef enum
++{
++  CANCEL_CLEANUP_EVENT_MASK_NONE,
++  CANCEL_CLEANUP_FRAME_FINISH,
++  CANCEL_CLEANUP_ENROLL_FINISH,
++  CANCEL_CLEANUP_COMPLETE,
++  CANCEL_CLEANUP_NUM_STATES,
++} CancelCleanupState;
++
+ typedef enum
+ {
+   DELETE_GET_USER_ID,
+@@ -279,7 +302,9 @@ typedef enum
+   ENROLL_SET_EVENT_FRAME_READY,
+   ENROLL_SEND_FRAME_ACQUIRE,
+   ENROLL_SET_EVENT_FINGER_DOWN,
++  ENROLL_SEND_WAIT_LED,
+   ENROLL_WAIT_FINGER_DOWN,
++  ENROLL_SEND_LED_OFF,
+   ENROLL_SET_EVENT_NONE,
+   ENROLL_SEND_FRAME_FINISH,
+   ENROLL_SEND_ADD_IMAGE,
+@@ -296,7 +321,9 @@ typedef enum
+   IDENTIFY_VERIFY_SET_EVENT_FRAME_READY,
+   IDENTIFY_VERIFY_SEND_FRAME_ACQUIRE,
+   IDENTIFY_VERIFY_SET_EVENT_FINGER_DOWN,
++  IDENTIFY_VERIFY_SEND_WAIT_LED,
+   IDENTIFY_VERIFY_WAIT_FINGER_DOWN,
++  IDENTIFY_VERIFY_SEND_LED_OFF,
+   IDENTIFY_VERIFY_SET_EVENT_NONE,
+   IDENTIFY_VERIFY_SEND_FRAME_FINISH,
+   IDENTIFY_VERIFY_IMAGE_METRICS,
+diff --git a/libfprint/libfprint/libfprint/drivers/synatlsmoc/tls_session.c b/libfprint/libfprint/libfprint/drivers/synatlsmoc/tls_session.c
+index d7cd1a1..562c25b 100644
+--- a/libfprint/libfprint/libfprint/drivers/synatlsmoc/tls_session.c
++++ b/libfprint/libfprint/libfprint/drivers/synatlsmoc/tls_session.c
+@@ -42,7 +42,7 @@
+ #include "tls_session.h"
+ #include "utils.h"
+ 
+-#define DEBUG_SSL TRUE
++#define DEBUG_SSL FALSE
+ 
+ #define RANDOM_SIZE 32
+ #define MASTER_SECRET_SIZE 48
+@@ -53,15 +53,6 @@
+ #define CERTIFICATE_MAX_KEY_SIZE 68
+ #define SIGNATURE_SIZE 256
+ 
+-#define DEBUG_SSL TRUE
+-
+-#define RANDOM_SIZE 32
+-#define MASTER_SECRET_SIZE 48
+-#define VERIFY_DATA_SIZE 12
+-#define MAX_SESSION_ID_SIZE 32
+-#define MAX_HASH_SIZE 64
+-#define MAX_KEY_BLOCK_SIZE 128
+-
+ #define ASPRINTF_ERROR_CHECK(msg, ...)                                       \
+   do                                                                         \
+     {                                                                        \
+@@ -773,18 +764,12 @@ tls_session_send_client_hello (TlsSession *self, GError **error)
+   msg->length = fpi_byte_writer_get_pos (&writer);
+   msg->body = fpi_byte_writer_reset_and_get_data (&writer);
+ 
+-  g_autofree gchar *ses_id_str =
+-      bin2hex (self->session_id, self->session_id_size);
+-  g_autofree gchar *rand_str = bin2hex (self->client_random, RANDOM_SIZE);
+-  g_autofree gchar *extensions_str =
+-      bin2hex (serialized_extensions, serialized_extensions_size);
+-  g_autofree gchar *suites_str = bin2hex (self->suites, self->suites_size);
+-
+   ASPRINTF_ERROR_CHECK (
+       msg->repr,
+-      "ClientHello(ver=0x%04x, rand=%s, ses_id=%s, cipher_suites=%s, "
+-      "compr_methods=[], extensions=%s)",
+-      self->version, rand_str, ses_id_str, suites_str, extensions_str);
++      "ClientHello(ver=0x%04x, random_len=%u, session_id_len=%u, "
++      "cipher_suites_len=%u, extensions_len=%" G_GSIZE_FORMAT ")",
++      self->version, RANDOM_SIZE, self->session_id_size, self->suites_size,
++      serialized_extensions_size);
+ 
+   if (!tls_session_send_handshake_msg (self, msg, &local_error))
+     {
+@@ -812,8 +797,8 @@ tls_session_send_finished (TlsSession *self, guint8 *verify_data, GError **error
+   msg->msg_type = SSL3_MT_FINISHED;
+   msg->length = fpi_byte_writer_get_pos (&writer);
+   msg->body = fpi_byte_writer_reset_and_get_data (&writer);
+-  g_autofree gchar *verify_data_str = bin2hex (verify_data, VERIFY_DATA_SIZE);
+-  ASPRINTF_ERROR_CHECK (msg->repr, "Finished(verify_data=%s)", verify_data_str);
++  ASPRINTF_ERROR_CHECK (msg->repr, "Finished(verify_data_len=%u)",
++                        VERIFY_DATA_SIZE);
+ 
+   if (!tls_session_send_handshake_msg (self, msg, &local_error))
+     {
+@@ -851,10 +836,8 @@ tls_session_send_certificate (TlsSession *self, GError **error)
+   msg->length = fpi_byte_writer_get_pos (&writer);
+   msg->body = fpi_byte_writer_reset_and_get_data (&writer);
+ 
+-  g_autofree gchar *cert_str =
+-      bin2hex (self->pairing_data->server_cert_raw, CERTIFICATE_SIZE);
+-  ASPRINTF_ERROR_CHECK (msg->repr, "Certificate(cert=TlsCertificate(data=%s))",
+-                        cert_str);
++  ASPRINTF_ERROR_CHECK (msg->repr, "Certificate(cert_len=%u)",
++                        CERTIFICATE_SIZE);
+ 
+   if (!tls_session_send_handshake_msg (self, msg, &local_error))
+     {
+@@ -878,8 +861,9 @@ tls_session_send_client_key_exchange (TlsSession *self,
+   msg->msg_type = SSL3_MT_CLIENT_KEY_EXCHANGE;
+   msg->length = key_len;
+   msg->body = key;
+-  g_autofree gchar *key_str = bin2hex (key, key_len);
+-  ASPRINTF_ERROR_CHECK (msg->repr, "ClientKeyExchange(data=%s)", key_str);
++  ASPRINTF_ERROR_CHECK (msg->repr,
++                        "ClientKeyExchange(data_len=%" G_GSIZE_FORMAT ")",
++                        key_len);
+ 
+   if (!tls_session_send_handshake_msg (self, msg, &local_error))
+     {
+@@ -911,9 +895,9 @@ tls_session_send_certificate_verify (TlsSession *self,
+   msg->length = fpi_byte_writer_get_pos (&writer);
+   msg->body = fpi_byte_writer_reset_and_get_data (&writer);
+ 
+-  g_autofree gchar *sign_str = bin2hex (signature, signature_len);
+-  ASPRINTF_ERROR_CHECK (msg->repr, "CertificateVerify(signed_hash=%s)",
+-                        sign_str);
++  ASPRINTF_ERROR_CHECK (msg->repr,
++                        "CertificateVerify(signature_len=%" G_GSIZE_FORMAT ")",
++                        signature_len);
+ 
+   if (!tls_session_send_handshake_msg (self, msg, &local_error))
+     {
+@@ -1016,15 +1000,12 @@ tls_session_receive_handshake (TlsSession *self, Handshake *msg, GError **error)
+ 
+         g_assert (session_id_len <= MAX_SESSION_ID_SIZE);
+ 
+-        g_autofree gchar *ses_id_str = bin2hex (session_id, session_id_len);
+-        g_autofree gchar *rand_str = bin2hex (random, RANDOM_SIZE);
+-
+ #if DEBUG_SSL
+         fp_dbg (
+             "<- HandshakeMessage(type=0x%02x, "
+-            "content=ServerHello(ver=0x%04x, rand=%s, ses_id='%s', "
++            "content=ServerHello(ver=0x%04x, random_len=%u, session_id_len=%u, "
+             "cipher_suite=0x%04x, compr_method=0x%02x, extensions[])",
+-            msg->msg_type, proto_ver, rand_str, ses_id_str, cipher_suite,
++            msg->msg_type, proto_ver, RANDOM_SIZE, session_id_len, cipher_suite,
+             compr_method);
+ #endif
+ 
+@@ -1356,11 +1337,10 @@ tls_session_receive_handshake (TlsSession *self, Handshake *msg, GError **error)
+         RETURN_FALSE_AND_SET_ERROR_IF_NOT_READ (read_ok);
+ 
+ #if DEBUG_SSL
+-        g_autofree gchar *verify_data_str =
+-            bin2hex (server_verify_data, VERIFY_DATA_SIZE);
+         fp_dbg (
+-            "<- HandshakeMessage(type=0x%02x, content=Finished(verify_data=%s))",
+-            msg->msg_type, verify_data_str);
++            "<- HandshakeMessage(type=0x%02x, "
++            "content=Finished(verify_data_len=%u))",
++            msg->msg_type, VERIFY_DATA_SIZE);
+ #endif
+ 
+         // Handle verify data
+@@ -1528,8 +1508,8 @@ tls_session_receive (TlsSession *self, TlsRecord *record, GError **error)
+             read_ok = fpi_byte_reader_get_data (&reader, app_data_size, &app_data);
+ 
+ #if DEBUG_SSL
+-            g_autofree gchar *app_data_str = bin2hex (app_data, app_data_size);
+-            fp_dbg ("<- ApplicationData(data=%s)", app_data_str);
++            fp_dbg ("<- ApplicationData(data_len=%" G_GSIZE_FORMAT ")",
++                    app_data_size);
+ #endif
+ 
+             fpi_byte_writer_put_data (&self->application_data, app_data,
+@@ -1709,8 +1689,9 @@ tls_session_send_application_data (TlsSession *self,
+   record->type = SSL3_RT_APPLICATION_DATA;
+   record->length = length;
+   record->fragment = g_memdup2 (data, length);
+-  g_autofree gchar *data_str = bin2hex (data, length);
+-  ASPRINTF_ERROR_CHECK (record->repr, "ApplicationData(data=%s)", data_str);
++  ASPRINTF_ERROR_CHECK (record->repr,
++                        "ApplicationData(data_len=%" G_GSIZE_FORMAT ")",
++                        length);
+ 
+   if (!tls_session_send (self, record, &local_error))
+     {
+@@ -1788,8 +1769,7 @@ generate_hs_priv_key (EVP_PKEY **hs_privkey, GError **error)
+    * 0xac, 0xb0, 0xef, 0x47, 0x9c, 0xae, 0x41, 0x40, 0xc7, 0xe8, 0xe2, 0x60,
+    * 0xdb, 0x3f, 0x64, 0x2e, 0x35, 0xd4, 0x09, 0x9c, 0x01, 0xb3, 0x6a, 0x86};
+    */
+-  g_autofree char *privkey_k_str = bin2hex (privkey_k, ECC_KEY_SIZE);
+-  fp_dbg ("Generated hs privkey k param: %s", privkey_k_str);
++  fp_dbg ("Generated built-in handshake signing key");
+ 
+   g_autoptr (OSSL_PARAM_BLD) param_bld = OSSL_PARAM_BLD_new ();
+   g_autoptr (BIGNUM) k_bn = BN_bin2bn (privkey_k, ECC_KEY_SIZE, NULL);
+@@ -1937,9 +1917,7 @@ create_host_certificate (EVP_PKEY *server_key,
+   RETURN_FALSE_AND_SET_ERROR_IF_NOT_WRITTEN (written);
+   g_assert (fpi_byte_writer_get_pos (&writer) == CERTIFICATE_SIZE);
+ 
+-  g_autofree char *host_certificate_str =
+-      bin2hex (*host_certificate_bytes, CERTIFICATE_SIZE);
+-  fp_dbg ("Genereted host certificate: %s", host_certificate_str);
++  fp_dbg ("Generated host certificate (%u bytes)", CERTIFICATE_SIZE);
+ 
+   return TRUE;
+ }
+diff --git a/libfprint/libfprint/libfprint/fprint-list-udev-hwdb.c b/libfprint/libfprint/libfprint/fprint-list-udev-hwdb.c
+index 4d056ae..05a1dd4 100644
+--- a/libfprint/libfprint/libfprint/fprint-list-udev-hwdb.c
++++ b/libfprint/libfprint/libfprint/fprint-list-udev-hwdb.c
+@@ -29,7 +29,6 @@ static const FpIdEntry allowlist_id_table[] = {
+    * You can generate this list from the wiki page using e.g.:
+    *   gio cat https://gitlab.freedesktop.org/libfprint/wiki/-/wikis/Unsupported-Devices.md | sed -n 's!|.*\([0-9a-fA-F]\{4\}\):\([0-9a-fA-F]\{4\}\).*|.*!  { .vid = 0x\1, .pid = 0x\2 },!p'
+    */
+-  { .vid = 0x047d, .pid = 0x00f2 },
+   { .vid = 0x04e8, .pid = 0x730b },
+   { .vid = 0x04f3, .pid = 0x036b },
+   { .vid = 0x04f3, .pid = 0x0c00 },
+@@ -60,11 +59,9 @@ static const FpIdEntry allowlist_id_table[] = {
+   { .vid = 0x06cb, .pid = 0x00c4 },
+   { .vid = 0x06cb, .pid = 0x00cb },
+   { .vid = 0x06cb, .pid = 0x00c9 },
+-  { .vid = 0x06cb, .pid = 0x00d8 },
+   { .vid = 0x06cb, .pid = 0x00da },
+   { .vid = 0x06cb, .pid = 0x00dc },
+   { .vid = 0x06cb, .pid = 0x00e4 },
+-  { .vid = 0x06cb, .pid = 0x00e7 },
+   { .vid = 0x06cb, .pid = 0x00e9 },
+   { .vid = 0x06cb, .pid = 0x00fd },
+   { .vid = 0x0a5c, .pid = 0x5801 },
+diff --git a/libfprint/libfprint/libfprint/meson.build b/libfprint/libfprint/libfprint/meson.build
+index 4822501..efed38d 100644
+--- a/libfprint/libfprint/libfprint/meson.build
++++ b/libfprint/libfprint/libfprint/meson.build
+@@ -141,6 +141,7 @@ driver_sources = {
+         [ 'drivers/synaptics/synaptics.c', 'drivers/synaptics/bmkt_message.c' ],
+     'synatlsmoc' :
+         [ 'drivers/synatlsmoc/synatlsmoc.c',
++          'drivers/synatlsmoc/kensington_transport.c',
+           'drivers/synatlsmoc/tagval.c',
+           'drivers/synatlsmoc/tls_session.c',
+           'drivers/synatlsmoc/utils.c' ],
+diff --git a/libfprint/libfprint/tests/meson.build b/libfprint/libfprint/tests/meson.build
+index dc3b70e..5649c3d 100644
+--- a/libfprint/libfprint/tests/meson.build
++++ b/libfprint/libfprint/tests/meson.build
+@@ -319,6 +319,22 @@ foreach test_name: unit_tests
+     )
+ endforeach
+ 
++if 'synatlsmoc' in drivers
++    synatlsmoc_kensington_test = executable(
++        'test-synatlsmoc-kensington',
++        sources: [
++            'test-synatlsmoc-kensington.c',
++            '../libfprint/drivers/synatlsmoc/kensington_transport.c',
++        ],
++        dependencies: [glib_dep, gio_dep],
++        c_args: common_cflags,
++        install: false,
++    )
++    test('synatlsmoc-kensington',
++         synatlsmoc_kensington_test,
++         suite: ['unit-tests'])
++endif
++
+ # Run udev rule generator with fatal warnings
+ envs.set('UDEV_HWDB', udev_hwdb.full_path())
+ envs.set('UDEV_HWDB_CHECK_CONTENTS', default_drivers_are_enabled ? '1' : '0')
+diff --git a/libfprint/libfprint/tests/test-synatlsmoc-kensington.c b/libfprint/libfprint/tests/test-synatlsmoc-kensington.c
+new file mode 100644
+index 0000000..79ffe41
+--- /dev/null
++++ b/libfprint/libfprint/tests/test-synatlsmoc-kensington.c
+@@ -0,0 +1,166 @@
++/*
++ * Unit tests for the Kensington endpoint-zero Tudor framing.
++ *
++ * Copyright (c) 2026 VeriMarkOnLinux contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++#include <gio/gio.h>
++#include <glib.h>
++
++#include "../libfprint/drivers/synatlsmoc/kensington_transport.h"
++
++static void
++assert_command_plan (gsize logical_length,
++                     gsize expected_wire_length,
++                     guint16 expected_value)
++{
++  g_autofree guint8 *logical = g_malloc (logical_length);
++  g_autofree guint8 *wire = NULL;
++  g_autoptr (GError) error = NULL;
++  KensingtonControlPlan plan;
++
++  for (gsize i = 0; i < logical_length; i++)
++    logical[i] = (guint8) (i + 1);
++
++  g_assert_true (kensington_transport_prepare_command (
++      logical, logical_length, &wire, &plan, &error));
++  g_assert_no_error (error);
++  g_assert_cmpuint (plan.request, ==, KENSINGTON_TUDOR_REQUEST_COMMAND);
++  g_assert_cmpuint (plan.value, ==, expected_value);
++  g_assert_cmpuint (plan.index, ==, 0);
++  g_assert_cmpuint (plan.wire_length, ==, expected_wire_length);
++  g_assert_cmpmem (wire, logical_length, logical, logical_length);
++
++  for (gsize i = logical_length; i < plan.wire_length; i++)
++    g_assert_cmpuint (wire[i], ==, 0);
++}
++
++static void
++test_capture_confirmed_command_shapes (void)
++{
++  assert_command_plan (1, 8, 1);
++  assert_command_plan (8, 8, 0);
++  assert_command_plan (76, 80, 4);
++  assert_command_plan (616, 616, 0);
++  assert_command_plan (617, 624, 1);
++}
++
++static void
++test_response_plan (void)
++{
++  g_autoptr (GError) error = NULL;
++  KensingtonControlPlan plan;
++
++  g_assert_true (kensington_transport_prepare_response (1671, &plan, &error));
++  g_assert_no_error (error);
++  g_assert_cmpuint (plan.request, ==, KENSINGTON_TUDOR_REQUEST_RESPONSE);
++  g_assert_cmpuint (plan.value, ==, 0);
++  g_assert_cmpuint (plan.index, ==, 0);
++  g_assert_cmpuint (plan.wire_length, ==, 1671);
++}
++
++static void
++test_invalid_lengths (void)
++{
++  const guint8 byte = 0xaa;
++  g_autofree guint8 *wire = NULL;
++  g_autoptr (GError) error = NULL;
++  KensingtonControlPlan plan;
++
++  g_assert_false (kensington_transport_prepare_command (
++      &byte, 0, &wire, &plan, &error));
++  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT);
++  g_clear_error (&error);
++
++  g_assert_false (kensington_transport_prepare_command (
++      &byte, G_MAXUINT16, &wire, &plan, &error));
++  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT);
++  g_clear_error (&error);
++
++  g_assert_false (kensington_transport_prepare_response (0, &plan, &error));
++  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT);
++}
++
++static void
++test_windows_event_mask_layout (void)
++{
++  guint8 encoded[KENSINGTON_EVENT_MASK_BYTES];
++  const guint8 expected[KENSINGTON_EVENT_MASK_BYTES] = {
++    0x04, 0x03, 0x02, 0x01, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0x04, 0x03, 0x02, 0x01, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++  };
++
++  kensington_transport_encode_event_mask (encoded, 0x01020304);
++  g_assert_cmpmem (encoded, sizeof (encoded), expected, sizeof (expected));
++}
++
++static void
++test_captured_led_ex2_layout (void)
++{
++  guint8 waiting[KENSINGTON_LED_EX2_COMMAND_SIZE];
++  guint8 rejected[KENSINGTON_LED_EX2_COMMAND_SIZE];
++  guint8 off[KENSINGTON_LED_EX2_COMMAND_SIZE];
++  const guint8 captured_prefix[] = {
++    0x39, 0x00, 0x71, 0x02, 0x00, 0xff, 0xff, 0x00, 0x00, 0x05,
++    0x7f, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x7f, 0x7f, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x05,
++    0x7f, 0x00, 0x20, 0x00, 0x00, 0x00,
++  };
++
++  const guint8 rejected_prefix[] = {
++    0x39, 0xe8, 0x03, 0x00, 0x00, 0x4b, 0x00, 0x00, 0x00, 0x07,
++    0x7f, 0x00, 0x20, 0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00,
++  };
++
++  kensington_transport_build_led_ex2 (waiting,
++                                       KENSINGTON_LED_EVENT_WAITING);
++  kensington_transport_build_led_ex2 (rejected,
++                                       KENSINGTON_LED_EVENT_REJECTED);
++  kensington_transport_build_led_ex2 (off, KENSINGTON_LED_EVENT_OFF);
++
++  g_assert_cmpmem (waiting, sizeof (captured_prefix), captured_prefix,
++                   sizeof (captured_prefix));
++  g_assert_cmpmem (rejected, sizeof (rejected_prefix), rejected_prefix,
++                   sizeof (rejected_prefix));
++  for (guint i = 0; i < 6; i++)
++    {
++      gsize offset = 5 + i * 20;
++
++      g_assert_cmpuint (off[offset + 7], ==, 0x20);
++    }
++  for (guint i = 3; i < 6; i++)
++    {
++      gsize offset = 5 + i * 20;
++
++      g_assert_cmpuint (waiting[offset], ==, 0x00);
++      g_assert_cmpuint (waiting[offset + 7], ==, 0x00);
++    }
++  for (guint i = 4; i < 6; i++)
++    {
++      gsize offset = 5 + i * 20;
++
++      g_assert_cmpuint (rejected[offset], ==, 0x00);
++      g_assert_cmpuint (rejected[offset + 7], ==, 0x00);
++    }
++}
++
++int
++main (int argc, char **argv)
++{
++  g_test_init (&argc, &argv, NULL);
++  g_test_add_func ("/synatlsmoc/kensington/command-shapes",
++                   test_capture_confirmed_command_shapes);
++  g_test_add_func ("/synatlsmoc/kensington/response-plan",
++                   test_response_plan);
++  g_test_add_func ("/synatlsmoc/kensington/invalid-lengths",
++                   test_invalid_lengths);
++  g_test_add_func ("/synatlsmoc/kensington/windows-event-mask-layout",
++                   test_windows_event_mask_layout);
++  g_test_add_func ("/synatlsmoc/kensington/captured-led-ex2-layout",
++                   test_captured_led_ex2_layout);
++  return g_test_run ();
++}
+-- 
+2.54.0
+
