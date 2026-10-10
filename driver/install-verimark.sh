@@ -41,7 +41,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-DEFAULT_BUILD_DIR="/home/sshadows/verimark-build/libfprint/build"
+# Default matches setup-libfprint-build.sh's default work dir ($HOME/verimark-build).
+# When run via sudo, resolve the *invoking* user's home, not root's.
+if [ -n "${SUDO_USER:-}" ] && command -v getent >/dev/null 2>&1; then
+  DEFAULT_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+fi
+DEFAULT_BUILD_DIR="${DEFAULT_HOME:-$HOME}/verimark-build/libfprint/build"
 BUILD_DIR="${VERIMARK_BUILD_DIR:-$DEFAULT_BUILD_DIR}"
 DO_UNINSTALL=0
 

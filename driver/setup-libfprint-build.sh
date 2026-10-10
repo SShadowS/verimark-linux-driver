@@ -190,7 +190,7 @@ Options:
                           checkout + build cache and just re-sync driver/*.c
                           + re-apply the meson registration edits).
   --meson-arg=STRING      Extra raw meson setup argument; repeatable.
-  --skip-deps             Don't run `sudo dnf install`.
+  --skip-deps             Don't install build deps (dnf, or apt-get on Debian-family).
   --skip-copy              Don't touch the work tree / driver files at all
                           (use an already-prepared $WORK_DIR/libfprint as-is).
   --skip-build             Don't run meson setup/compile.
@@ -252,8 +252,21 @@ echo "  libfprint source : $LIBFPRINT_SRC"
 echo "  -Ddrivers=        : $DRIVERS_OPT"
 echo "  build target      : ${MESON_TARGET:-<all>}"
 
-# ---- 1. Fedora build deps --------------------------------------------------
-if [ "$DO_DEPS" -eq 1 ]; then
+# ---- 1. Build deps (Fedora/dnf or Debian-family/apt) ------------------------
+if [ "$DO_DEPS" -eq 1 ] && ! command -v dnf >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+  # Debian/Ubuntu equivalents of the dnf list below. systemd-dev is the
+  # non-obvious one: libfprint asks for the `udev` pkg-config module, whose
+  # udev.pc ships in systemd-dev (not libudev-dev) on Debian-family systems.
+  log "Installing build dependencies (sudo apt-get install)"
+  sudo apt-get install -y \
+    meson ninja-build cmake gcc g++ pkgconf git rsync \
+    libglib2.0-dev libgusb-dev libssl-dev libjson-glib-dev libpixman-1-dev \
+    libnss3-dev libgirepository1.0-dev libsystemd-dev libcairo2-dev \
+    libudev-dev libgudev-1.0-dev systemd-dev fprintd libpam-fprintd \
+  || die "apt-get install failed — fix and re-run, or pass --skip-deps once satisfied"
+elif [ "$DO_DEPS" -eq 1 ]; then
+  command -v dnf >/dev/null 2>&1 \
+    || die "neither dnf nor apt-get found — install the build deps by hand and pass --skip-deps"
   log "Installing build dependencies (sudo dnf install)"
   # Core list per the task brief, plus gcc-c++ (libfprint's project() declares
   # C++ as a language for examples/cpp-test.cpp — meson refuses to configure

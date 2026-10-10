@@ -112,6 +112,46 @@ test_build_frame_finish (void)
   hexchk (b, verimark_moc_build_frame_finish (b), "81");
 }
 
+/* 0x39 LED_EX2 — 125 B; WAITING matches the Windows capture
+ * (`39 00 71 02 00 ffff0000 05 7f 00 20 000000 00 7f7f 0000 0000 0000 ...`). */
+static void
+test_build_led_ex2 (void)
+{
+  guint8 b[VERIMARK_LED_EX2_CMD_LEN];
+  guint i;
+
+  g_assert_cmpuint (verimark_moc_build_led_ex2 (b, VERIMARK_LED_WAITING), ==, 125);
+  g_assert_cmphex (b[0], ==, 0x39);
+  g_assert_cmphex (b[1], ==, 0x00);
+  g_assert_cmphex (b[2], ==, 0x71);
+  g_assert_cmphex (b[3], ==, 0x02);
+  g_assert_cmphex (b[4], ==, 0x00);
+  for (i = 0; i < 3; i++)   /* three identical 20-byte blocks */
+    {
+      g_assert_cmphex (b[5 + i * 20 + 0], ==, 0xff);
+      g_assert_cmphex (b[5 + i * 20 + 1], ==, 0xff);
+      g_assert_cmphex (b[5 + i * 20 + 4], ==, 0x05);
+      g_assert_cmphex (b[5 + i * 20 + 5], ==, 0x7f);
+      g_assert_cmphex (b[5 + i * 20 + 7], ==, 0x20);
+      g_assert_cmphex (b[5 + i * 20 + 12], ==, 0x7f);
+      g_assert_cmphex (b[5 + i * 20 + 13], ==, 0x7f);
+    }
+  for (i = 65; i < 125; i++)   /* blocks 4-6 stay zero */
+    g_assert_cmphex (b[i], ==, 0x00);
+
+  g_assert_cmpuint (verimark_moc_build_led_ex2 (b, VERIMARK_LED_OFF), ==, 125);
+  g_assert_cmphex (b[0], ==, 0x39);
+  g_assert_cmphex (b[2], ==, 0x00);
+  g_assert_cmphex (b[3], ==, 0x00);
+  for (i = 0; i < 6; i++)   /* only the 0x20 flag byte per frame is set */
+    {
+      guint j;
+
+      for (j = 0; j < 20; j++)
+        g_assert_cmphex (b[5 + i * 20 + j], ==, j == 7 ? 0x20 : 0x00);
+    }
+}
+
 /* ============================================================================
  * Task 2 — response parsers. Offsets from findings/51 + p2_moc.py
  * _run_enroll (l.204,212), mode_verify (l.256-260), _list (l.849-853),
@@ -440,6 +480,7 @@ main (int argc, char **argv)
   g_test_add_func ("/verimark/moc/build/acq_enroll", test_build_frame_acq_enroll);
   g_test_add_func ("/verimark/moc/build/acq_verify", test_build_frame_acq_verify);
   g_test_add_func ("/verimark/moc/build/frame_finish", test_build_frame_finish);
+  g_test_add_func ("/verimark/moc/build/led_ex2", test_build_led_ex2);
 
   g_test_add_func ("/verimark/moc/parse/sample_ok", test_parse_sample_ok);
   g_test_add_func ("/verimark/moc/parse/sample_too_short", test_parse_sample_too_short);

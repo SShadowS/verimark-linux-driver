@@ -34,17 +34,24 @@ enumerate or garbage-collect prints on the device. Details in
 
 - **The hardware:** a Kensington VeriMark Desktop (`047d:00f2`). Confirm it's
   plugged in with `lsusb -d 047d:00f2`.
-- **A Fedora / RHEL-family system.** `setup-libfprint-build.sh` installs its
-  dependencies with `dnf`. It was developed and verified on **Fedora 44**. On
-  Debian/Arch/etc. the build still works, but you must translate the package
-  list yourself (see below) and run the setup script with `--skip-deps`.
-- **`sudo` access** — both scripts need it (`dnf install`, and the `fprintd`
-  drop-in / udev-rule install).
+- **A Fedora / RHEL-family or Debian / Ubuntu system.** `setup-libfprint-build.sh`
+  installs its dependencies with `dnf` or, on Debian-family systems, `apt-get`.
+  It was developed and verified on **Fedora 44**, and also tested on hardware
+  on **Ubuntu 26.04** (apt package list and notes in
+  [`docs/ubuntu-26.04.md`](docs/ubuntu-26.04.md)). On other distros (Arch, etc.)
+  the build still works, but you must translate the package list yourself (see
+  below) and run the setup script with `--skip-deps`.
+  Wiring it into KDE (lock screen, SDDM, KWallet) is covered in
+  [`docs/kde-pam.md`](docs/kde-pam.md).
+- **`sudo` access** — both scripts need it (the package install, and the
+  `fprintd` drop-in / udev-rule install).
 - **Network access** — the setup script clones upstream `libfprint`
   (1.94.10) from `gitlab.freedesktop.org`. Already have a checkout? Pass
   `--libfprint-src /path/to/libfprint` to skip the clone.
-- **Build dependencies.** On Fedora the setup script installs these for you;
-  they're the equivalents to find on other distros:
+- **Build dependencies.** On Fedora (dnf) and Debian/Ubuntu (apt-get) the setup
+  script installs these for you (the Debian package names are listed in
+  [`docs/ubuntu-26.04.md`](docs/ubuntu-26.04.md)); the Fedora names are the
+  equivalents to find on other distros:
 
   ```
   meson ninja-build cmake gcc gcc-c++ pkgconf-pkg-config

@@ -69,6 +69,19 @@ gsize verimark_moc_build_enroll_commit (guint8 out[5]);    /* 0x96 04 (5 B)  */
 gsize verimark_moc_build_frame_acq     (guint8 out[17], guint8 acq_kind); /* 0x80 (17 B) */
 gsize verimark_moc_build_frame_finish  (guint8 out[1]);    /* 0x81 (1 B)     */
 
+/* 0x39 LED_EX2 (125 B) — cosmetic "touch the sensor now" indicator. Frames are
+ * replayed from the Windows capture (findings/25; same bytes as the synatlsmoc
+ * kensington_transport_build_led_ex2); only the two events the host needs. */
+#define VERIMARK_LED_EX2_CMD_LEN 125
+
+typedef enum {
+  VERIMARK_LED_OFF     = 0,
+  VERIMARK_LED_WAITING = 1,
+} VerimarkLedEvent;
+
+gsize verimark_moc_build_led_ex2 (guint8 out[VERIMARK_LED_EX2_CMD_LEN],
+                                  VerimarkLedEvent event);
+
 /* 0x96 03 finalize (124 B): splice template_id into [19:35] and sid (28 B) into
  * [49:77] of the WIN_FINALIZE template (p2_moc.py:52-53, build_finalize).
  * Returns FALSE on bad args (NULL template_id/sid/out). */
