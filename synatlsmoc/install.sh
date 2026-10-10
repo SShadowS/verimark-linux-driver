@@ -106,7 +106,15 @@ do_status() {
   fi
   echo "drop-in      : $( [ -f "$DROPIN_FILE" ] && echo "$DROPIN_FILE" || echo '(none)')"
   echo "udev rule    : $( [ -f "$UDEV_RULE_DST" ] && echo "$UDEV_RULE_DST" || echo '(none)')"
-  echo "pairing file : $( [ -f "$PDATA_FILE" ] && echo "$PDATA_FILE (present — paired)" || echo '(none — will pair on first enroll)')"
+  # The state dir (/var/lib/fprint/...) is root-only, so as a normal user a missing-looking
+  # file proves nothing; say so instead of claiming the key is unpaired.
+  if [ -f "$PDATA_FILE" ]; then
+    echo "pairing file : $PDATA_FILE (present — paired)"
+  elif [ "$(id -u)" -ne 0 ]; then
+    echo "pairing file : (unknown — $PDATA_DIR is root-only; re-run with sudo for an accurate answer)"
+  else
+    echo "pairing file : (none — will pair on first enroll)"
+  fi
   echo "old install  : $( [ -f "$OLD_DROPIN_FILE" ] || [ -d "$OLD_RELOC_DIR" ] && echo 'PRESENT (will be removed on install)' || echo 'absent')"
   echo "fprintd      : $(systemctl is-active fprintd 2>/dev/null || echo inactive) (D-Bus activated)"
   echo "Environment  :"; systemctl show fprintd -p Environment -p ExecStart 2>/dev/null | sed 's/^/  /'

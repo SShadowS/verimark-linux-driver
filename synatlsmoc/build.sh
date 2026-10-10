@@ -53,11 +53,17 @@ for t in git sha256sum gcc meson ninja pkg-config; do
 done
 if [ "${#missing[@]}" -gt 0 ]; then
   die "missing build tools: ${missing[*]}
-     Install with: sudo dnf install -y gcc glib2-devel libgusb-devel \\
-       openssl-devel cairo-devel meson ninja-build pkgconf"
+     Fedora:         sudo dnf install -y gcc glib2-devel libgusb-devel \\
+                       openssl-devel cairo-devel meson ninja-build pkgconf
+     Debian/Ubuntu:  sudo apt install gcc g++ git cmake meson ninja-build pkgconf \\
+                       libglib2.0-dev libgusb-dev libssl-dev libcairo2-dev \\
+                       libpixman-1-dev libnss3-dev libudev-dev libgudev-1.0-dev \\
+                       libjson-glib-dev libgirepository1.0-dev libsystemd-dev systemd-dev
+                     (systemd-dev provides udev.pc; without it meson stops with
+                     'Dependency \"udev\" not found'. This set built cleanly on Ubuntu 26.04.)"
 fi
 for dep in glib-2.0 gusb libcrypto cairo; do
-  pkg-config --exists "$dep" || die "missing devel lib: $dep (see dnf line above)"
+  pkg-config --exists "$dep" || die "missing devel lib: $dep (see the package lines above)"
 done
 
 # ---- verify the pinned patch ------------------------------------------------
